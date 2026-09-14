@@ -216,6 +216,9 @@ def block_diffusion_generate(
     sample_file_hidden_similarity=None,
     cold_expert_budget=0,
     cold_expert_selection='probability_sum',
+    cold_reuse_interval=0,
+    hot_prune_count=0,
+    hot_protect_top1=True,
     metrics_collector=None):
     '''
     Args:
@@ -323,6 +326,7 @@ def block_diffusion_generate(
             spec_attn_mask[:, 64:96, num_block * block_length: (num_block + 2) * block_length] = 0
             spec_attn_mask[:, 96:, num_block * block_length: (num_block + 3) * block_length] = 0
         
+        previous_cold = None
         for i in range(denoising_steps + 1): # 有一步需要专门用于缓存 kv cache，后续可以优化掉
             mask_index = (cur_x == mask_id)
             if mask_index.sum() == 0:
@@ -463,6 +467,14 @@ def block_diffusion_generate(
 
                     expert_limit_index = (distances > 3) & ~top2_mask & (spec_x0_p < 0.7)
 
+                    cold_now = expert_limit_index & spec_mask_index
+                    reuse_mask = None
+                    if (cold_reuse_interval > 1 and previous_cold is not None
+                            and i % cold_reuse_interval != 0):
+                        parent_cold = previous_cold.view(4, block_length)[choice_id]
+                        reuse_mask = cold_now & parent_cold.repeat(1, 4)
+                    previous_cold = cold_now
+
                     model_output, new_hidden_states = _team_denoising_forward(
                         model,
                         metrics_collector,
@@ -477,6 +489,10 @@ def block_diffusion_generate(
                         expert_limit_index=expert_limit_index,
                         cold_expert_budget=cold_expert_budget,
                         cold_expert_selection=cold_expert_selection,
+                        cold_reuse_mask=reuse_mask,
+                        hot_mask=spec_mask_index & ~expert_limit_index,
+                        hot_prune_count=hot_prune_count,
+                        hot_protect_top1=hot_protect_top1,
                         choice_id=choice_id,
                         cache_position=spec_cache_position)
                     
@@ -1113,6 +1129,17 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
         generation_kwargs = self.generation_kwargs.copy()
         generation_kwargs.update(kwargs)
         cold_expert_budget = generation_kwargs.get('cold_expert_budget', 0)
+        cold_reuse_interval = generation_kwargs.get('cold_reuse_interval', 0)
+        hot_prune_count = generation_kwargs.get('hot_prune_count', 0)
+        hot_protect_top1 = generation_kwargs.get('hot_protect_top1', True)
+        for name, value in [('cold_reuse_interval', cold_reuse_interval),
+                            ('hot_prune_count', hot_prune_count)]:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f'{name} must be a non-negative integer')
+        if cold_reuse_interval == 1:
+            raise ValueError('cold_reuse_interval must be 0 (off) or >= 2')
+        if not isinstance(hot_protect_top1, bool):
+            raise ValueError('hot_protect_top1 must be boolean')
         if isinstance(cold_expert_budget, bool) or not isinstance(
                 cold_expert_budget, int) or cold_expert_budget < 0:
             raise ValueError(
@@ -1167,6 +1194,9 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
             sample_file_hidden_similarity=sample_file_hidden_similarity,
             cold_expert_budget=cold_expert_budget,
             cold_expert_selection=cold_expert_selection,
+            cold_reuse_interval=cold_reuse_interval,
+            hot_prune_count=hot_prune_count,
+            hot_protect_top1=hot_protect_top1,
             metrics_collector=metrics_collector,
             )[:, tokens["input_ids"].shape[1]:]
 

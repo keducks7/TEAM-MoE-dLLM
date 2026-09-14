@@ -283,7 +283,9 @@ class SDARMoeSparseMoeBlock(nn.Module):
     def forward(self, hidden_states: torch.Tensor, past_hidden_states=None,
                 decoded_index=None, expert_limit_index=None,
                 cold_expert_budget: int = 0,
-                cold_expert_selection: str = "probability_sum") -> torch.Tensor:
+                cold_expert_selection: str = "probability_sum",
+                cold_reuse_mask=None, hot_mask=None,
+                hot_prune_count: int = 0, hot_protect_top1: bool = True) -> torch.Tensor:
         # """ """
         # batch_size, sequence_length, hidden_dim = hidden_states.shape
         # hidden_states = hidden_states.view(-1, hidden_dim)
@@ -384,6 +386,8 @@ class SDARMoeSparseMoeBlock(nn.Module):
             
             # 反转decoded_index，因为我们想要计算的是False的位置（未解码的token）
             compute_mask = ~decoded_index  # True表示需要计算的位置
+            if cold_reuse_mask is not None:
+                compute_mask = compute_mask & ~cold_reuse_mask
             
             # 展平张量
             hidden_states_flat = hidden_states.view(-1, hidden_dim)
@@ -538,6 +542,32 @@ class SDARMoeSparseMoeBlock(nn.Module):
                     #     compute_selected_experts[limited_token_indices] = limited_selected_experts
                     #     compute_routing_weights_topk[limited_token_indices] = limited_routing_weights_topk
                 
+                # Build the cold pool BEFORE pruning hot routes, so this
+                # intervention cannot silently change cold's candidate set.
+                if hot_prune_count > 0 and hot_mask is not None:
+                    hot_rows = hot_mask.reshape(-1)[compute_mask_flat]
+                    hot_ids = torch.where(hot_rows)[0]
+                    if hot_ids.numel() > 0:
+                        original_hot = compute_selected_experts[hot_ids]
+                        counts = torch.bincount(
+                            original_hot.flatten(), minlength=self.num_experts)
+                        pool = counts > 0
+                        protected = torch.zeros_like(pool)
+                        if hot_protect_top1:
+                            protected[original_hot[:, 0]] = True
+                        candidates = torch.where(pool & ~protected)[0]
+                        # Keep at least top_k distinct experts in the pool.
+                        remove_n = min(int(hot_prune_count), candidates.numel(),
+                                       max(int(pool.sum()) - self.top_k, 0))
+                        if remove_n > 0:
+                            order = torch.argsort(counts[candidates], stable=True)
+                            pool[candidates[order[:remove_n]]] = False
+                            scores = compute_routing_weights[hot_ids].masked_fill(
+                                ~pool.unsqueeze(0), -torch.inf)
+                            weights, ids = torch.topk(scores, self.top_k, dim=-1)
+                            compute_selected_experts[hot_ids] = ids
+                            compute_routing_weights_topk[hot_ids] = weights
+
                 # 应用标准化（如果需要）
                 if self.norm_topk_prob:
                     compute_routing_weights_topk /= compute_routing_weights_topk.sum(dim=-1, keepdim=True)
@@ -705,7 +735,11 @@ class SDARMoeDecoderLayer(nn.Module):
                 decoded_index,
                 expert_limit_index,
                 cold_expert_budget,
-                cold_expert_selection)
+                cold_expert_selection,
+                cold_reuse_mask=kwargs.get('cold_reuse_mask'),
+                hot_mask=kwargs.get('hot_mask'),
+                hot_prune_count=kwargs.get('hot_prune_count', 0),
+                hot_protect_top1=kwargs.get('hot_protect_top1', True))
         else:
             hidden_states = self.mlp(hidden_states)
         
