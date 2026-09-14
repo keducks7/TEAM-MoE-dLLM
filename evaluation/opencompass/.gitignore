@@ -6,6 +6,7 @@ scripts/
 scripts/*
 !scripts/team.sh
 !scripts/team_interventions_acc.sh
+!scripts/team_eval_existing.sh
 !scripts/test_team_interventions.py
 !scripts/team_b0_hook_seed_check.sh
 !scripts/wait_for_gpus_then_run_team_b0.sh
