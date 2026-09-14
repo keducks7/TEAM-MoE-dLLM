@@ -8,8 +8,8 @@ from .icl_gen_inferencer import GenInferencer_gsm8k  # noqa
 from .icl_gen_inferencer import GenInferencer_math  # noqa
 from .icl_gen_inferencer import GenInferencer_humaneval  # noqa
 from .icl_gen_inferencer import GenInferencer_mbpp  # noqa
-from .icl_gen_inferencer import GenInferencer_humaneval_2  # noqa
-from .icl_gen_inferencer import GenInferencer_mbpp_2  # noqa
+# from .icl_gen_inferencer import GenInferencer_humaneval_2  # noqa
+# from .icl_gen_inferencer import GenInferencer_mbpp_2  # noqa
 from .icl_inference_ppl_only_inferencer import \
     InferencePPLOnlyInferencer  # noqa
 from .icl_ll_inferencer import LLInferencer  # noqa

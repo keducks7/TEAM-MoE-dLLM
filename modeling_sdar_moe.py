@@ -280,7 +280,10 @@ class SDARMoeSparseMoeBlock(nn.Module):
              for _ in range(self.num_experts)]
         )
 
-    def forward(self, hidden_states: torch.Tensor, past_hidden_states = None, decoded_index = None, expert_limit_index = None) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, past_hidden_states=None,
+                decoded_index=None, expert_limit_index=None,
+                cold_expert_budget: int = 0,
+                cold_expert_selection: str = "probability_sum") -> torch.Tensor:
         # """ """
         # batch_size, sequence_length, hidden_dim = hidden_states.shape
         # hidden_states = hidden_states.view(-1, hidden_dim)
@@ -429,12 +432,90 @@ class SDARMoeSparseMoeBlock(nn.Module):
                         necessary_mask[necessary_experts_flat] = True
                     else:
                         necessary_mask = torch.zeros(self.num_experts, dtype=torch.bool, device=compute_selected_experts.device)
-                    
+
+                    # All cold tokens in this layer/forward share a fixed
+                    # budget of additional unique experts. The selection
+                    # strategy controls how cold-token preferences are
+                    # aggregated before choosing the shared extra set.
+                    budget = max(int(cold_expert_budget), 0)
+                    if budget > 0 and len(limited_token_indices) > 0:
+                        available_mask = ~necessary_mask
+                        # Avoid a GPU-to-CPU synchronization here. If fewer
+                        # than `num_extra` experts are available, top-k may
+                        # also return already-allowed entries with -inf scores;
+                        # setting those mask positions again is harmless.
+                        num_extra = min(budget, self.num_experts)
+                        if num_extra > 0:
+                            cold_routing_weights = compute_routing_weights[
+                                limited_token_indices]
+                            if cold_expert_selection == "probability_sum":
+                                cold_expert_scores = cold_routing_weights.sum(
+                                    dim=0)
+                            elif cold_expert_selection == "top1_frequency":
+                                # Each cold token votes for its most preferred
+                                # expert outside the already active hot set.
+                                outside_hot_weights = (
+                                    cold_routing_weights.masked_fill(
+                                        ~available_mask.unsqueeze(0),
+                                        -torch.inf))
+                                preferred_experts = outside_hot_weights.argmax(
+                                    dim=-1)
+                                cold_expert_scores = torch.zeros(
+                                    self.num_experts,
+                                    dtype=cold_routing_weights.dtype,
+                                    device=cold_routing_weights.device)
+                                cold_expert_scores.scatter_add_(
+                                    0,
+                                    preferred_experts,
+                                    torch.ones_like(
+                                        preferred_experts,
+                                        dtype=cold_routing_weights.dtype))
+                            elif cold_expert_selection == "top8_frequency":
+                                # Vote only for experts in each cold token's
+                                # original unrestricted model top-k (top-8 for
+                                # SDAR-30B-A3B), then exclude the hot set.
+                                cold_topk_experts = compute_selected_experts[
+                                    limited_token_indices]
+                                cold_expert_scores = torch.zeros(
+                                    self.num_experts,
+                                    dtype=cold_routing_weights.dtype,
+                                    device=cold_routing_weights.device)
+                                cold_expert_scores.scatter_add_(
+                                    0,
+                                    cold_topk_experts.flatten(),
+                                    torch.ones_like(
+                                        cold_topk_experts.flatten(),
+                                        dtype=cold_routing_weights.dtype))
+                            else:
+                                raise ValueError(
+                                    "Unsupported cold_expert_selection: "
+                                    f"{cold_expert_selection!r}")
+                            cold_expert_scores = cold_expert_scores.masked_fill(
+                                ~available_mask, -torch.inf)
+                            extra_experts = torch.topk(
+                                cold_expert_scores, k=num_extra).indices
+                            # Frequency strategies can have fewer than B
+                            # experts with a vote. Do not pad the extra set
+                            # with arbitrary zero-vote experts.
+                            valid_extra = (
+                                cold_expert_scores[extra_experts] > 0)
+                            necessary_mask[
+                                extra_experts[valid_extra]] = True
+
                     if len(limited_token_indices) > 0:
                         invalid_expert_mask = ~necessary_mask
-                        compute_routing_weights[:, invalid_expert_mask] = 0
-                        compute_routing_weights_topk, compute_selected_experts = torch.topk(
-                            compute_routing_weights, self.top_k, dim=-1)
+                        limited_routing_weights = compute_routing_weights[
+                            limited_token_indices].clone()
+                        limited_routing_weights[:, invalid_expert_mask] = 0
+                        limited_weights_topk, limited_selected_experts = (
+                            torch.topk(
+                                limited_routing_weights,
+                                self.top_k,
+                                dim=-1))
+                        compute_routing_weights_topk[
+                            limited_token_indices] = limited_weights_topk
+                        compute_selected_experts[
+                            limited_token_indices] = limited_selected_experts
                     # if len(limited_token_indices) > 0:
                     #     # 获取需要限制的token的数据
                     #     limited_selected_experts = compute_selected_experts[limited_token_indices]
@@ -555,8 +636,9 @@ class SDARMoeDecoderLayer(nn.Module):
         past_hidden_states = None,
         decoded_index = None,
         expert_limit_index = None,
+        cold_expert_budget: int = 0,
+        cold_expert_selection: str = "probability_sum",
         choice_id = None,
-        new_hidden_states = None,
         cache_position: Optional[torch.LongTensor] = None,
         # necessary, but kept here for BC
         position_embeddings: Optional[Tuple[torch.Tensor,
@@ -617,7 +699,13 @@ class SDARMoeDecoderLayer(nn.Module):
             selected_hidden_states = past_hidden_states[:, start_idx:end_idx, :]
             # 将选中的序列复制 4 次
             past_hidden_states = torch.tile(selected_hidden_states, (1, 4, 1))
-            hidden_states = self.mlp(hidden_states, past_hidden_states, decoded_index, expert_limit_index)
+            hidden_states = self.mlp(
+                hidden_states,
+                past_hidden_states,
+                decoded_index,
+                expert_limit_index,
+                cold_expert_budget,
+                cold_expert_selection)
         else:
             hidden_states = self.mlp(hidden_states)
         
@@ -626,10 +714,13 @@ class SDARMoeDecoderLayer(nn.Module):
         else:
             router_logits = None
 
-        new_hidden_states.append(hidden_states)
+        current_hidden_state = hidden_states
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
+        # Return the cached MLP output explicitly. Accelerate copies mutable
+        # containers when dispatching layers across devices, so mutating a
+        # list received through kwargs loses entries at device boundaries.
+        outputs = (hidden_states, current_hidden_state)
 
         if output_attentions:
             outputs += (self_attn_weights,)
@@ -750,6 +841,8 @@ class SDARMoeModel(SDARMoePreTrainedModel):
         stored_hidden_states = None,
         decoded_index = None,
         expert_limit_index = None,
+        cold_expert_budget: int = 0,
+        cold_expert_selection: str = "probability_sum",
         choice_id = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -842,18 +935,19 @@ class SDARMoeModel(SDARMoePreTrainedModel):
                     past_hidden_states = past_hidden_states,
                     decoded_index = decoded_index,
                     expert_limit_index = expert_limit_index,
+                    cold_expert_budget = cold_expert_budget,
+                    cold_expert_selection = cold_expert_selection,
                     choice_id = choice_id,
-                    new_hidden_states = new_hidden_states,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
                     **flash_attn_kwargs,
                 )
 
             hidden_states = layer_outputs[0]
-            # current_hidden_states.append(hidden_states) 
+            new_hidden_states.append(layer_outputs[1])
 
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                all_self_attns += (layer_outputs[2],)
 
             if output_router_logits:
                 all_router_logits += (layer_outputs[-1],)
@@ -1175,6 +1269,8 @@ class SDARMoeForCausalLM(SDARMoePreTrainedModel, GenerationMixin):
         stored_hidden_states = None,
         decoded_index = None,
         expert_limit_index = None,
+        cold_expert_budget: int = 0,
+        cold_expert_selection: str = "probability_sum",
         choice_id = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -1226,6 +1322,8 @@ class SDARMoeForCausalLM(SDARMoePreTrainedModel, GenerationMixin):
             stored_hidden_states = stored_hidden_states,
             decoded_index = decoded_index,
             expert_limit_index = expert_limit_index,
+            cold_expert_budget = cold_expert_budget,
+            cold_expert_selection = cold_expert_selection,
             choice_id = choice_id,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,

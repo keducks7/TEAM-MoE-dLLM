@@ -30,6 +30,75 @@ from transformers.cache_utils import (
     DynamicCache,
 )
 
+
+def _install_team_metric_hooks(model):
+    """Count experts that actually execute without changing model outputs.
+
+    TEAM may reuse hidden states for decoded tokens and may restrict the
+    candidate expert set for masked tokens. Recomputing top-k routes from the
+    gate output would therefore over-count work. Expert hooks observe the
+    actual MLP calls instead; calls with an empty token batch are ignored.
+    """
+    if hasattr(model, '_sdar_team_metric_hook_handles'):
+        return
+
+    handles = []
+    layer_count = 0
+    for module in model.modules():
+        if module.__class__.__name__ != 'SDARMoeSparseMoeBlock':
+            continue
+
+        layer_id = layer_count
+        layer_count += 1
+        for expert_id, expert in enumerate(module.experts):
+            def capture_expert_call(
+                    _expert, expert_inputs, _expert_output,
+                    current_layer=layer_id, current_expert=expert_id):
+                collector = getattr(model, '_sdar_metrics_collector', None)
+                if collector is None or not expert_inputs:
+                    return
+                expert_input = expert_inputs[0]
+                if not torch.is_tensor(expert_input) or expert_input.numel() == 0:
+                    return
+                collector.setdefault('_active_experts_by_layer', {}).setdefault(
+                    current_layer, set()).add(current_expert)
+
+            handles.append(expert.register_forward_hook(capture_expert_call))
+
+    if layer_count == 0:
+        raise RuntimeError(
+            'No SDARMoeSparseMoeBlock modules were found for TEAM metric '
+            'collection. Check that the model directory contains TEAM '
+            'modeling_sdar_moe.py.')
+    model._sdar_team_metric_hook_handles = handles
+    model._sdar_team_metric_layer_count = layer_count
+    model._sdar_metrics_collector = None
+
+
+def _team_denoising_forward(model, metrics_collector, **model_inputs):
+    """Run one measured TEAM denoising forward and update APF totals."""
+    if metrics_collector is None:
+        return model(**model_inputs)
+
+    metrics_collector['_active_experts_by_layer'] = {}
+    model._sdar_metrics_collector = metrics_collector
+    try:
+        outputs = model(**model_inputs)
+    finally:
+        model._sdar_metrics_collector = None
+
+    active_by_layer = metrics_collector.pop('_active_experts_by_layer')
+    expected_layers = model._sdar_team_metric_layer_count
+    if len(active_by_layer) != expected_layers:
+        raise RuntimeError(
+            'TEAM metric hooks captured active experts for '
+            f'{len(active_by_layer)} of {expected_layers} MoE layers.')
+    metrics_collector['activated_experts'] += sum(
+        len(experts) for experts in active_by_layer.values())
+    metrics_collector['layer_forwards'] += expected_layers
+    metrics_collector['denoising_forwards'] += 1
+    return outputs
+
 def add_gumbel_noise(logits, temperature):
     '''
     The Gumbel max is a method for sampling categorical distributions.
@@ -144,7 +213,10 @@ def block_diffusion_generate(
     stopping_criteria_idx=None,
     sample_file_expert_distribution=None, 
     sample_file_decoded_order=None, 
-    sample_file_hidden_similarity=None):
+    sample_file_hidden_similarity=None,
+    cold_expert_budget=0,
+    cold_expert_selection='probability_sum',
+    metrics_collector=None):
     '''
     Args:
         model: Mask predictor.
@@ -156,6 +228,11 @@ def block_diffusion_generate(
         cfg_scale: Unsupervised classifier-free guidance scale.
         remasking: Remasking strategy. 'low_confidence' or 'random'.
         mask_id: The toke id of [MASK]
+        cold_expert_budget: Additional unique experts shared by all cold
+            tokens in each MoE layer and denoising forward. Zero reproduces
+            the original TEAM expert restriction.
+        cold_expert_selection: How to select the shared extra experts. One of
+            'probability_sum', 'top1_frequency', or 'top8_frequency'.
     '''
 
     # 仅仅支持单个输入，不支持 batch inference
@@ -259,14 +336,16 @@ def block_diffusion_generate(
                 break
             else:
                 if i == 0:
-                    model_output, new_hidden_states = model(
-                    input_ids=cur_x,
-                    attention_mask=cur_attn_mask,
-                    position_ids=cur_position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                    store_kv=False,
-                    stored_hidden_states = None)
+                    model_output, new_hidden_states = _team_denoising_forward(
+                        model,
+                        metrics_collector,
+                        input_ids=cur_x,
+                        attention_mask=cur_attn_mask,
+                        position_ids=cur_position_ids,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                        store_kv=False,
+                        stored_hidden_states=None)
                 
                     logits = model_output.logits
                     # stored_hidden_states = new_hidden_states
@@ -384,18 +463,22 @@ def block_diffusion_generate(
 
                     expert_limit_index = (distances > 3) & ~top2_mask & (spec_x0_p < 0.7)
 
-                    model_output, new_hidden_states = model(
+                    model_output, new_hidden_states = _team_denoising_forward(
+                        model,
+                        metrics_collector,
                         input_ids=speculative_blocks,
                         attention_mask=spec_attn_mask,
                         position_ids=spec_position_ids,
                         past_key_values=past_key_values,
                         use_cache=True,
                         store_kv=False,
-                        stored_hidden_states = stored_hidden_states,
-                        decoded_index = spec_decoded_index,
-                        expert_limit_index = expert_limit_index,
-                        choice_id = choice_id,
-                        cache_position = spec_cache_position)
+                        stored_hidden_states=stored_hidden_states,
+                        decoded_index=spec_decoded_index,
+                        expert_limit_index=expert_limit_index,
+                        cold_expert_budget=cold_expert_budget,
+                        cold_expert_selection=cold_expert_selection,
+                        choice_id=choice_id,
+                        cache_position=spec_cache_position)
                     
                     logits = model_output.logits
                     stored_hidden_states = new_hidden_states
@@ -494,6 +577,10 @@ def block_diffusion_generate(
                     confidence = spec_confidence[choice_id].unsqueeze(0)
                     cur_x = speculative_blocks[:, choice_id * block_length: (choice_id + 1) * block_length]
                     cur_x[transfer_index] = x0[transfer_index]
+
+                if metrics_collector is not None:
+                    metrics_collector['accepted_tokens'] += int(
+                        transfer_index.sum().item())
         
         x[:, num_block * block_length: (num_block + 1) * block_length] = cur_x
         for stop_idx in stopping_criteria_idx:
@@ -678,6 +765,8 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
                  fastchat_template: Optional[str] = None,
                  stop_words: Optional[str] = [],
                  mode: str = 'none',
+                 collect_metrics: bool = False,
+                 metrics_output_dir: Optional[str] = None,
                  **other_kwargs):
 
         self.logger = get_logger()
@@ -691,6 +780,22 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
         self.generation_kwargs = generation_kwargs
         self.fastchat_template = fastchat_template
         self.stop_words = list(set(stop_words + self._get_potential_stop_words(path)))
+        self.collect_metrics = collect_metrics
+        self.metrics_output_dir = metrics_output_dir
+        self._metrics_sequence = 0
+        self._metrics_totals = {
+            'sequences': 0,
+            'activated_experts': 0,
+            'layer_forwards': 0,
+            'accepted_tokens': 0,
+            'denoising_forwards': 0,
+        }
+        if self.collect_metrics:
+            if not self.metrics_output_dir:
+                raise ValueError(
+                    'metrics_output_dir is required when collect_metrics=True')
+            os.makedirs(self.metrics_output_dir, exist_ok=True)
+            _install_team_metric_hooks(self.model)
         assert mode in ['none', 'mid']
         self.mode = mode
         self.logger.info(f'using stop words: {self.stop_words}')
@@ -698,6 +803,25 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
         for k, v in other_kwargs.items():
             if v is not None:
                 self.logger.warning(f'Unused argument {k}={v}')
+
+    def get_metrics_summary(self):
+        """Return process-local micro-averaged TEAM metrics."""
+        if not self.collect_metrics:
+            return None
+        totals = self._metrics_totals.copy()
+        layer_forwards = totals['layer_forwards']
+        denoising_forwards = totals['denoising_forwards']
+        apf = (totals['activated_experts'] / layer_forwards
+               if layer_forwards else None)
+        tpf = (totals['accepted_tokens'] / denoising_forwards
+               if denoising_forwards else None)
+        totals.update({
+            'method': 'team',
+            'APF': apf,
+            'TPF': tpf,
+            'APT': apf / tpf if apf is not None and tpf else None,
+        })
+        return totals
 
     def _load_tokenizer(self, path: Optional[str], kwargs: dict, pad_token_id: Optional[int] = None):
         from transformers import AutoTokenizer, GenerationConfig
@@ -988,6 +1112,22 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
 
         generation_kwargs = self.generation_kwargs.copy()
         generation_kwargs.update(kwargs)
+        cold_expert_budget = generation_kwargs.get('cold_expert_budget', 0)
+        if isinstance(cold_expert_budget, bool) or not isinstance(
+                cold_expert_budget, int) or cold_expert_budget < 0:
+            raise ValueError(
+                'cold_expert_budget must be a non-negative integer, got '
+                f'{cold_expert_budget!r}.')
+        cold_expert_selection = generation_kwargs.get(
+            'cold_expert_selection', 'probability_sum')
+        valid_cold_expert_selections = {
+            'probability_sum', 'top1_frequency', 'top8_frequency'
+        }
+        if cold_expert_selection not in valid_cold_expert_selections:
+            raise ValueError(
+                'cold_expert_selection must be one of '
+                f'{sorted(valid_cold_expert_selections)}, got '
+                f'{cold_expert_selection!r}.')
         # generation_kwargs.update(diffusion_kwargs)
         stopping_criteria = list(set(stopping_criteria + self.stop_words))
         if stopping_criteria:
@@ -998,6 +1138,15 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
             generation_kwargs['min_new_tokens'] = min_out_len
         generation_kwargs['pad_token_id'] = self.tokenizer.pad_token_id
         stopping_criteria_idx = [self.tokenizer.encode(stop, add_special_tokens=False)[0] for stop in stopping_criteria]
+        metrics_collector = None
+        if self.collect_metrics:
+            metrics_collector = {
+                'activated_experts': 0,
+                'layer_forwards': 0,
+                'accepted_tokens': 0,
+                'denoising_forwards': 0,
+            }
+
         outputs = block_diffusion_generate(
             self.model,
             self.tokenizer,
@@ -1016,7 +1165,41 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
             sample_file_expert_distribution=sample_file_expert_distribution, 
             sample_file_decoded_order=sample_file_decoded_order, 
             sample_file_hidden_similarity=sample_file_hidden_similarity,
+            cold_expert_budget=cold_expert_budget,
+            cold_expert_selection=cold_expert_selection,
+            metrics_collector=metrics_collector,
             )[:, tokens["input_ids"].shape[1]:]
+
+        if self.collect_metrics:
+            layer_forwards = metrics_collector['layer_forwards']
+            denoising_forwards = metrics_collector['denoising_forwards']
+            accepted_tokens = metrics_collector['accepted_tokens']
+            apf = (metrics_collector['activated_experts'] / layer_forwards
+                   if layer_forwards else None)
+            tpf = (accepted_tokens / denoising_forwards
+                   if denoising_forwards else None)
+            record = {
+                'schema': 'sdar_metrics_v1',
+                'method': 'team',
+                'cold_expert_budget': cold_expert_budget,
+                'cold_expert_selection': cold_expert_selection,
+                'sequence': self._metrics_sequence,
+                **metrics_collector,
+                'APF': apf,
+                'TPF': tpf,
+                'APT': apf / tpf if apf is not None and tpf else None,
+            }
+            self._metrics_totals['sequences'] += 1
+            for name in (
+                    'activated_experts', 'layer_forwards',
+                    'accepted_tokens', 'denoising_forwards'):
+                self._metrics_totals[name] += int(metrics_collector[name])
+            metrics_file = os.path.join(
+                self.metrics_output_dir,
+                f'team_metrics_pid{os.getpid()}.jsonl')
+            with open(metrics_file, 'a', encoding='utf-8') as file:
+                file.write(json.dumps(record) + '\n')
+            self._metrics_sequence += 1
 
         decodeds = self.tokenizer.batch_decode(outputs, skip_special_tokens=False)
         decodeds = [t.replace('<|MASK|>', '') for t in decodeds]

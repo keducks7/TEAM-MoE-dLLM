@@ -563,7 +563,6 @@ class SDARMoeDecoderLayer(nn.Module):
         decoded_index = None,
         expert_limit_index = None,
         choice_id = None,
-        new_hidden_states = None,
         cache_position: Optional[torch.LongTensor] = None,
         # necessary, but kept here for BC
         position_embeddings: Optional[Tuple[torch.Tensor,
@@ -635,10 +634,13 @@ class SDARMoeDecoderLayer(nn.Module):
             router_logits = None
             selected_experts = None
 
-        new_hidden_states.append(hidden_states)
+        current_hidden_state = hidden_states
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
+        # Return the cached MLP output explicitly. Accelerate copies mutable
+        # containers when dispatching layers across devices, so mutating a
+        # list received through kwargs loses entries at device boundaries.
+        outputs = (hidden_states, current_hidden_state)
 
         if output_attentions:
             outputs += (self_attn_weights,)
@@ -853,20 +855,19 @@ class SDARMoeModel(SDARMoePreTrainedModel):
                     decoded_index = decoded_index,
                     expert_limit_index = expert_limit_index,
                     choice_id = choice_id,
-                    new_hidden_states = new_hidden_states,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
                     **flash_attn_kwargs,
                 )
 
             hidden_states = layer_outputs[0]
-            # current_hidden_states.append(hidden_states) 
+            new_hidden_states.append(layer_outputs[1])
 
             if selected_experts is not None:
                 selected_experts_layers.append(selected_experts)
 
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                all_self_attns += (layer_outputs[2],)
 
             if output_router_logits:
                 all_router_logits += (layer_outputs[-1],)

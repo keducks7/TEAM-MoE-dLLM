@@ -205,3 +205,12 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Local experiment artifacts (keep reusable metric code only).
+.DS_Store
+/tmp/
+/moe_dllm_routing_research_assessment.md
+/evaluation/opencompass/analysis/*
+!/evaluation/opencompass/analysis/tools/
+/evaluation/opencompass/analysis/tools/*
+!/evaluation/opencompass/analysis/tools/calculate_team_metrics.py

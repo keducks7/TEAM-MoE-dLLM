@@ -3,7 +3,7 @@ from mmengine.config import read_base
 from opencompass.runners import LocalRunner
 from opencompass.partitioners import NaivePartitioner, NumWorkerPartitioner
 from opencompass.tasks import OpenICLInferTask, OpenICLEvalTask
-from opencompass.models import BD3withChatTemplate_decoded_jump_expert_limit_speculative_mark
+from opencompass.models import BD3withChatTemplate_decoded_jump_expert_limit_speculative
 
 
 with read_base():
@@ -11,7 +11,7 @@ with read_base():
     from opencompass.configs.datasets.mmlu.mmlu_gen_4d595a import mmlu_datasets
     # math
     from opencompass.configs.datasets.gsm8k.gsm8k_0shot_v2_gen_17d799 import gsm8k_datasets
-    from opencompass.configs.datasets.math.math_prm800k_500_0shot_cot_gen_11c4b5_2 import math_datasets
+    from opencompass.configs.datasets.math.math_prm800k_500_0shot_cot_gen_11c4b5 import math_datasets
     from opencompass.configs.datasets.humaneval.humaneval_gen import humaneval_datasets
     from opencompass.configs.datasets.mbpp.sanitized_mbpp_mdblock_0shot_nocot_gen_a2e416 import sanitized_mbpp_datasets
 
@@ -83,20 +83,20 @@ summarizer = dict(
 )
 
 # datasets = [*mmlu_datasets, *gsm8k_datasets, *humaneval_datasets, *sanitized_mbpp_datasets, *math_datasets, *mathbench_datasets, *ifeval_datasets]
-datasets = [*math_datasets]
+datasets = [*sanitized_mbpp_datasets]
 for dataset in datasets:
     dataset['infer_cfg']['inferencer']['batch_size'] = 1 # only support batchsize=1 up to now
 
 # model
 model_configs = [
-    ("SDAR-30B-A3B-Chat-b32-thr0_95", "/xxx/Models/SDAR/SDAR-30B-A3B-Chat-b32", 32, 0.95, 1)
+    ("SDAR-30B-A3B-Chat-b32-thr0_95", "/root/lkd/Models/SDAR-30B-A3B-Chat-b32", 32, 0.95, 2)
 ]
 models = []
 for abbr, path, block_length, threshold, num_gpus in model_configs:
 
     models.append(
         dict(
-        type=BD3withChatTemplate_decoded_jump_expert_limit_speculative_mark,
+        type=BD3withChatTemplate_decoded_jump_expert_limit_speculative,
         abbr=abbr,
         path=path,
         run_cfg=dict(num_gpus=num_gpus),
@@ -115,6 +115,12 @@ for abbr, path, block_length, threshold, num_gpus in model_configs:
         model_kwargs=dict(
             torch_dtype=torch.float16,
             trust_remote_code=True,
+            device_map="balanced",
+            max_memory={
+                0: "37GiB",
+                1: "37GiB",
+            },
+            low_cpu_mem_usage=True,
         ),
     )
     )

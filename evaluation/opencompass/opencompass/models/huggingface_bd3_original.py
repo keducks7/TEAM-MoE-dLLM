@@ -2,6 +2,9 @@
 # yapf: disable
 from typing import Dict, List, Optional, Union
 
+import json
+import os
+
 from einops import rearrange
 import torch
 import numpy as np
@@ -26,6 +29,264 @@ from transformers.cache_utils import (
     Cache,
     DynamicCache,
 )
+
+
+def _install_vanilla_metric_hooks(model, collect_expert_outputs=False):
+    """Observe MoE routing/outputs without changing model return values.
+
+    Expert-output hooks are optional because they add norm/cosine reductions to
+    each executed expert MLP.  The reductions stay on the layer device until a
+    whole denoising forward has completed; full hidden states are never saved.
+    """
+    if hasattr(model, '_sdar_metric_hook_handles'):
+        if (collect_expert_outputs
+                and not hasattr(model, '_sdar_expert_output_hook_handles')):
+            raise RuntimeError(
+                'Vanilla metric hooks were installed without expert-output '
+                'hooks. Reload the model with collect_expert_output_stats=True.')
+        return
+
+    handles = []
+    expert_output_handles = []
+    for module in model.modules():
+        if module.__class__.__name__ != 'SDARMoeSparseMoeBlock':
+            continue
+
+        layer_index = len(handles)
+        top_k_experts = int(module.top_k)
+        norm_topk_prob = bool(getattr(module, 'norm_topk_prob', False))
+
+        def capture_gate_output(_gate, _inputs, router_logits,
+                                top_k=top_k_experts,
+                                normalize=norm_topk_prob,
+                                layer_id=layer_index):
+            collector = getattr(model, '_sdar_metrics_collector', None)
+            if collector is None:
+                return
+            k = min(top_k, router_logits.shape[-1])
+            routing_weights = F.softmax(router_logits, dim=-1,
+                                        dtype=torch.float)
+            routing_weights, selected_experts = torch.topk(
+                routing_weights, k=k, dim=-1)
+            if normalize:
+                routing_weights /= routing_weights.sum(
+                    dim=-1, keepdim=True)
+            active_experts = torch.zeros(
+                router_logits.shape[-1],
+                dtype=torch.bool,
+                device=router_logits.device)
+            active_experts.scatter_(0, selected_experts.reshape(-1), True)
+            collector['_active_expert_counts'].append(active_experts.sum())
+            if collector.get('_trace_enabled', False):
+                collector['_layer_routes'].append((
+                    layer_id,
+                    selected_experts.detach(),
+                    routing_weights.detach(),
+                ))
+
+            if (collector.get('_expert_output_enabled', False)
+                    or collector.get('_expert_token_enabled', False)):
+                mask_flat = collector.get('_current_mask_flat')
+                if mask_flat is None:
+                    raise RuntimeError(
+                        'Expert-output collection requires the current token mask.')
+                if mask_flat.numel() != selected_experts.shape[0]:
+                    raise RuntimeError(
+                        'Expert-output mask length does not match MoE gate tokens.')
+                state_is_masked = mask_flat.reshape(-1).to(
+                    device=selected_experts.device, dtype=torch.bool)
+                collector.setdefault('_expert_route_context', {})[layer_id] = (
+                    selected_experts.detach(),
+                    routing_weights.detach(),
+                    state_is_masked,
+                )
+                if collector.get('_expert_output_enabled', False):
+                    shape = (2, int(router_logits.shape[-1]))
+                    collector.setdefault('_expert_layer_output_stats', {})[
+                        layer_id] = {
+                            'count': torch.zeros(
+                                shape, device=router_logits.device,
+                                dtype=torch.int32),
+                            'routing_weight_sum': torch.zeros(
+                                shape, device=router_logits.device,
+                                dtype=torch.float32),
+                            'input_norm_sum': torch.zeros(
+                                shape, device=router_logits.device,
+                                dtype=torch.float32),
+                            'output_norm_sum': torch.zeros(
+                                shape, device=router_logits.device,
+                                dtype=torch.float32),
+                            'weighted_output_norm_sum': torch.zeros(
+                                shape, device=router_logits.device,
+                                dtype=torch.float32),
+                            'output_input_cosine_sum': torch.zeros(
+                                shape, device=router_logits.device,
+                                dtype=torch.float32),
+                            'output_input_norm_ratio_sum': torch.zeros(
+                                shape, device=router_logits.device,
+                                dtype=torch.float32),
+                        }
+                if collector.get('_expert_token_enabled', False):
+                    token_shape = tuple(selected_experts.shape)
+                    collector.setdefault('_expert_layer_token_stats', {})[
+                        layer_id] = {
+                            name: torch.full(
+                                token_shape, torch.nan,
+                                device=router_logits.device,
+                                dtype=torch.float32)
+                            for name in (
+                                'input_norm', 'output_norm',
+                                'weighted_output_norm',
+                                'output_input_cosine',
+                                'output_input_norm_ratio')
+                        }
+
+        handles.append(module.gate.register_forward_hook(capture_gate_output))
+
+        if collect_expert_outputs:
+            for expert_index, expert in enumerate(module.experts):
+                def capture_expert_output(
+                        _expert, expert_inputs, expert_output,
+                        layer_id=layer_index, expert_id=expert_index):
+                    collector = getattr(model, '_sdar_metrics_collector', None)
+                    if (collector is None
+                            or not (
+                                collector.get('_expert_output_enabled', False)
+                                or collector.get(
+                                    '_expert_token_enabled', False))):
+                        return
+                    context = collector.get('_expert_route_context', {}).get(
+                        layer_id)
+                    layer_stats = collector.get(
+                        '_expert_layer_output_stats', {}).get(layer_id)
+                    layer_token_stats = collector.get(
+                        '_expert_layer_token_stats', {}).get(layer_id)
+                    if context is None or (layer_stats is None
+                                           and layer_token_stats is None):
+                        raise RuntimeError(
+                            f'Missing route context for layer {layer_id}.')
+                    if not torch.is_tensor(expert_output):
+                        raise RuntimeError(
+                            'Expert-output collection expects each expert MLP '
+                            'to return one tensor.')
+                    selected_experts, routing_weights, state_is_masked = context
+                    token_indices, topk_slots = torch.where(
+                        selected_experts == expert_id)
+                    if expert_output.shape[0] != token_indices.numel():
+                        raise RuntimeError(
+                            f'Layer {layer_id} expert {expert_id} output rows '
+                            'do not match its routed token count.')
+                    if token_indices.numel() == 0:
+                        return
+                    expert_input = expert_inputs[0]
+                    if expert_input.shape != expert_output.shape:
+                        raise RuntimeError(
+                            'Expert input/output shapes differ; norm comparison '
+                            'would not be valid.')
+                    weights = routing_weights[token_indices, topk_slots].float()
+                    masked = state_is_masked[token_indices]
+                    input_float = expert_input.float()
+                    output_float = expert_output.float()
+                    input_norm = torch.linalg.vector_norm(input_float, dim=-1)
+                    output_norm = torch.linalg.vector_norm(output_float, dim=-1)
+                    cosine = F.cosine_similarity(
+                        input_float, output_float, dim=-1, eps=1e-8)
+                    norm_ratio = output_norm / input_norm.clamp_min(1e-8)
+                    weighted_output_norm = output_norm * weights
+                    if layer_token_stats is not None:
+                        layer_token_stats['input_norm'][
+                            token_indices, topk_slots] = input_norm
+                        layer_token_stats['output_norm'][
+                            token_indices, topk_slots] = output_norm
+                        layer_token_stats['weighted_output_norm'][
+                            token_indices, topk_slots] = weighted_output_norm
+                        layer_token_stats['output_input_cosine'][
+                            token_indices, topk_slots] = cosine
+                        layer_token_stats['output_input_norm_ratio'][
+                            token_indices, topk_slots] = norm_ratio
+                    if layer_stats is not None:
+                        for state_id, selection in enumerate((masked, ~masked)):
+                            count = selection.sum()
+                            layer_stats['count'][state_id, expert_id] = count
+                            layer_stats['routing_weight_sum'][
+                                state_id, expert_id] = weights[selection].sum()
+                            layer_stats['input_norm_sum'][
+                                state_id, expert_id] = input_norm[selection].sum()
+                            layer_stats['output_norm_sum'][
+                                state_id, expert_id] = output_norm[selection].sum()
+                            layer_stats['weighted_output_norm_sum'][
+                                state_id, expert_id] = weighted_output_norm[
+                                    selection].sum()
+                            layer_stats['output_input_cosine_sum'][
+                                state_id, expert_id] = cosine[selection].sum()
+                            layer_stats['output_input_norm_ratio_sum'][
+                                state_id, expert_id] = norm_ratio[selection].sum()
+
+                expert_output_handles.append(
+                    expert.register_forward_hook(capture_expert_output))
+
+    if not handles:
+        raise RuntimeError(
+            'No SDARMoeSparseMoeBlock modules were found for Vanilla metric '
+            'collection.')
+    model._sdar_metric_hook_handles = handles
+    if collect_expert_outputs:
+        model._sdar_expert_output_hook_handles = expert_output_handles
+    model._sdar_metrics_collector = None
+
+
+def _layer_statistics_to_numpy(layer_stats, statistic_names,
+                               output_dtype=None):
+    """Stack layer-local tensors without moving sharded layers to one GPU."""
+    ordered_layers = sorted(layer_stats)
+    results = {}
+    for statistic in statistic_names:
+        device_groups = {}
+        for position, layer_id in enumerate(ordered_layers):
+            tensor = layer_stats[layer_id][statistic]
+            device_groups.setdefault(tensor.device, []).append(
+                (position, tensor))
+        combined = None
+        for tensors_on_device in device_groups.values():
+            positions = [item[0] for item in tensors_on_device]
+            stacked = torch.stack([
+                item[1] for item in tensors_on_device
+            ]).detach().to(device='cpu').numpy()
+            if combined is None:
+                combined = np.empty(
+                    (len(ordered_layers),) + stacked.shape[1:],
+                    dtype=stacked.dtype)
+            combined[positions] = stacked
+        if output_dtype is not None:
+            combined = combined.astype(output_dtype, copy=False)
+        results[statistic] = combined
+    return ordered_layers, results
+
+
+def _extract_causal_lm_logits(model_output, model):
+    """Handle both ModelOutput and tuple returns from SDAR remote code."""
+    if hasattr(model_output, 'logits'):
+        return model_output.logits
+
+    if isinstance(model_output, (tuple, list)):
+        # TEAM-style remote code may wrap the CausalLM ModelOutput in a tuple.
+        for item in model_output:
+            if hasattr(item, 'logits'):
+                return item.logits
+
+        # Standard Hugging Face return_dict=False puts the logits tensor in
+        # the output tuple.  Validate its vocabulary dimension so a base
+        # model's hidden state cannot be mistaken for logits.
+        vocab_size = int(model.config.vocab_size)
+        for item in model_output:
+            if (torch.is_tensor(item) and item.ndim >= 3
+                    and item.shape[-1] == vocab_size):
+                return item
+
+    raise RuntimeError(
+        'The loaded model did not return causal-LM logits.  Make sure '
+        'AutoModelForCausalLM loaded SDARMoeForCausalLM rather than the base '
+        f'model. Got output type: {type(model_output).__name__}.')
 
 def add_gumbel_noise(logits, temperature):
     '''
@@ -138,7 +399,8 @@ def block_diffusion_generate(
     top_p=1.0,
     remasking='low_confidence',
     threshold=1.0,
-    stopping_criteria_idx=None):
+    stopping_criteria_idx=None,
+    metrics_collector=None):
     '''
     Args:
         model: Mask predictor.
@@ -219,13 +481,182 @@ def block_diffusion_generate(
                     store_kv=True)
                 break
             else:
-                logits = model(
-                    input_ids=cur_x,
-                    attention_mask=cur_attn_mask,
-                    position_ids=cur_position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                    store_kv=False).logits
+                if metrics_collector is not None:
+                    metrics_collector['_active_expert_counts'] = []
+                    if metrics_collector.get('_trace_enabled', False):
+                        metrics_collector['_layer_routes'] = []
+                        trace_token_ids = cur_x.detach().clone()
+                        trace_mask_before = mask_index.detach().clone()
+                    if (metrics_collector.get('_expert_output_enabled', False)
+                            or metrics_collector.get(
+                                '_expert_token_enabled', False)):
+                        metrics_collector['_expert_route_context'] = {}
+                        if metrics_collector.get(
+                                '_expert_output_enabled', False):
+                            metrics_collector[
+                                '_expert_layer_output_stats'] = {}
+                        if metrics_collector.get(
+                                '_expert_token_enabled', False):
+                            metrics_collector[
+                                '_expert_layer_token_stats'] = {}
+                        metrics_collector['_current_mask_flat'] = (
+                            mask_index.detach().reshape(-1))
+                    model._sdar_metrics_collector = metrics_collector
+                try:
+                    model_output = model(
+                        input_ids=cur_x,
+                        attention_mask=cur_attn_mask,
+                        position_ids=cur_position_ids,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                        store_kv=False)
+                finally:
+                    if metrics_collector is not None:
+                        model._sdar_metrics_collector = None
+                logits = _extract_causal_lm_logits(model_output, model)
+
+                if metrics_collector is not None:
+                    active_counts = metrics_collector.pop(
+                        '_active_expert_counts')
+                    if not active_counts:
+                        raise RuntimeError(
+                            'No MoE gate outputs were captured during a '
+                            'denoising forward.')
+                    # Layers can reside on different GPUs under device_map.
+                    metrics_collector['activated_experts'] += sum(
+                        int(count.item()) for count in active_counts)
+                    metrics_collector['layer_forwards'] += len(active_counts)
+                    metrics_collector['denoising_forwards'] += 1
+                    token_output_stats = None
+                    if metrics_collector.get('_expert_output_enabled', False):
+                        layer_stats = metrics_collector.pop(
+                            '_expert_layer_output_stats')
+                        if len(layer_stats) != len(active_counts):
+                            raise RuntimeError(
+                                'Expert-output layer count does not match the '
+                                'APF layer count.')
+                        _, step_stats = _layer_statistics_to_numpy(
+                            layer_stats, (
+                                'count', 'routing_weight_sum',
+                                'input_norm_sum', 'output_norm_sum',
+                                'weighted_output_norm_sum',
+                                'output_input_cosine_sum',
+                                'output_input_norm_ratio_sum'))
+                        by_step = metrics_collector[
+                            '_expert_output_by_step']
+                        if i not in by_step:
+                            by_step[i] = step_stats
+                        else:
+                            for statistic, values in step_stats.items():
+                                by_step[i][statistic] += values
+                        metrics_collector['_expert_output_forward_counts'][
+                            i] = metrics_collector[
+                                '_expert_output_forward_counts'].get(i, 0) + 1
+                        state_counts = np.asarray([
+                            int(mask_index.sum().item()),
+                            int((~mask_index).sum().item()),
+                        ], dtype=np.int64)
+                        if i not in metrics_collector[
+                                '_expert_output_state_token_counts']:
+                            metrics_collector[
+                                '_expert_output_state_token_counts'][i] = (
+                                    state_counts)
+                        else:
+                            metrics_collector[
+                                '_expert_output_state_token_counts'][i] += (
+                                    state_counts)
+                        metrics_collector[
+                            '_expert_output_pair_opportunities'][i] = (
+                                metrics_collector[
+                                    '_expert_output_pair_opportunities'].get(
+                                        i, 0)
+                                + int(state_counts[0] * state_counts[1]))
+                    if metrics_collector.get('_expert_token_enabled', False):
+                        layer_token_stats = metrics_collector.pop(
+                            '_expert_layer_token_stats')
+                        if len(layer_token_stats) != len(active_counts):
+                            raise RuntimeError(
+                                'Expert-token layer count does not match the '
+                                'APF layer count.')
+                        _, token_output_stats = _layer_statistics_to_numpy(
+                            layer_token_stats, (
+                                'input_norm', 'output_norm',
+                                'weighted_output_norm',
+                                'output_input_cosine',
+                                'output_input_norm_ratio'),
+                            output_dtype=np.float16)
+                        for statistic, values in token_output_stats.items():
+                            if not np.isfinite(values).all():
+                                raise RuntimeError(
+                                    f'Expert-token statistic {statistic} was '
+                                    'not filled for every routed assignment.')
+                    if (metrics_collector.get('_expert_output_enabled', False)
+                            or metrics_collector.get(
+                                '_expert_token_enabled', False)):
+                        metrics_collector.pop('_expert_route_context', None)
+                        metrics_collector.pop('_current_mask_flat', None)
+                    if metrics_collector.get('_trace_enabled', False):
+                        layer_routes = sorted(
+                            metrics_collector.pop('_layer_routes'),
+                            key=lambda item: item[0])
+                        if len(layer_routes) != len(active_counts):
+                            raise RuntimeError(
+                                'Route trace layer count does not match the '
+                                'APF layer count.')
+                        if cur_x.shape[0] != 1:
+                            raise RuntimeError(
+                                'Vanilla route tracing currently requires '
+                                'batch_size=1.')
+
+                        expert_ids = []
+                        routing_weights = []
+                        layer_ids = []
+                        for layer_id, selected, weights in layer_routes:
+                            expected_tokens = cur_x.numel()
+                            if selected.shape[0] != expected_tokens:
+                                raise RuntimeError(
+                                    'MoE gate token count does not match the '
+                                    'current decoding block.')
+                            expert_ids.append(
+                                selected.reshape(
+                                    cur_x.shape[0], cur_x.shape[1], -1)[0]
+                                .to(device='cpu', dtype=torch.int16).numpy())
+                            routing_weights.append(
+                                weights.reshape(
+                                    cur_x.shape[0], cur_x.shape[1], -1)[0]
+                                .to(device='cpu', dtype=torch.float16).numpy())
+                            layer_ids.append(layer_id)
+
+                        block_start = num_block * block_length
+                        global_positions = np.arange(
+                            block_start, block_start + cur_x.shape[1],
+                            dtype=np.int32)
+                        prompt_before = global_positions < prompt_length
+                        state_before = np.where(
+                            trace_mask_before[0].to(device='cpu').numpy(),
+                            2,
+                            np.where(prompt_before, 0, 1)).astype(np.int8)
+                        pending_trace = {
+                            'block_id': num_block,
+                            'block_start': block_start,
+                            'denoising_step': i,
+                            'layer_ids': np.asarray(layer_ids, dtype=np.int16),
+                            'global_positions': global_positions,
+                            'token_ids_before': trace_token_ids[0].to(
+                                device='cpu', dtype=torch.int32).numpy(),
+                            'mask_before': trace_mask_before[0].to(
+                                device='cpu').numpy(),
+                            'state_before': state_before,
+                            'expert_ids': np.stack(expert_ids, axis=0),
+                            'routing_weights': np.stack(
+                                routing_weights, axis=0),
+                        }
+                        if token_output_stats is not None:
+                            pending_trace.update({
+                                f'expert_{name}': values
+                                for name, values in token_output_stats.items()
+                            })
+                        metrics_collector['_pending_trace'] = pending_trace
 
                 logits_with_noise = add_gumbel_noise(
                     logits, temperature=temperature)
@@ -278,6 +709,15 @@ def block_diffusion_generate(
                         transfer_index[j, select_index] = True
 
                 cur_x[transfer_index] = x0[transfer_index]
+                if metrics_collector is not None:
+                    metrics_collector['accepted_tokens'] += int(
+                        transfer_index.sum().item())
+                    if metrics_collector.get('_trace_enabled', False):
+                        pending_trace = metrics_collector.pop('_pending_trace')
+                        pending_trace['accepted_after'] = transfer_index[0].to(
+                            device='cpu').numpy()
+                        metrics_collector['trace_forwards'].append(
+                            pending_trace)
 
         x[:, num_block * block_length: (num_block + 1) * block_length] = cur_x
         for stop_idx in stopping_criteria_idx:
@@ -462,6 +902,13 @@ class BD3withChatTemplate_original(BaseModel):
                  fastchat_template: Optional[str] = None,
                  stop_words: Optional[str] = [],
                  mode: str = 'none',
+                 collect_metrics: bool = False,
+                 metrics_output_dir: Optional[str] = None,
+                 collect_routing_trace: bool = False,
+                 routing_trace_output_dir: Optional[str] = None,
+                 collect_expert_output_stats: bool = False,
+                 expert_output_stats_dir: Optional[str] = None,
+                 collect_expert_token_stats: bool = False,
                  **other_kwargs):
 
         self.logger = get_logger()
@@ -475,6 +922,50 @@ class BD3withChatTemplate_original(BaseModel):
         self.generation_kwargs = generation_kwargs
         self.fastchat_template = fastchat_template
         self.stop_words = list(set(stop_words + self._get_potential_stop_words(path)))
+        self.collect_routing_trace = collect_routing_trace
+        self.routing_trace_output_dir = routing_trace_output_dir
+        self.collect_expert_output_stats = collect_expert_output_stats
+        self.expert_output_stats_dir = expert_output_stats_dir
+        self.collect_expert_token_stats = collect_expert_token_stats
+        self.collect_metrics = (
+            collect_metrics or collect_routing_trace
+            or collect_expert_output_stats or collect_expert_token_stats)
+        self.metrics_output_dir = metrics_output_dir
+        self._metrics_sequence = 0
+        self._metrics_totals = {
+            'sequences': 0,
+            'activated_experts': 0,
+            'layer_forwards': 0,
+            'accepted_tokens': 0,
+            'denoising_forwards': 0,
+        }
+        if self.collect_metrics:
+            if not self.metrics_output_dir:
+                raise ValueError(
+                    'metrics_output_dir is required when collect_metrics=True')
+            os.makedirs(self.metrics_output_dir, exist_ok=True)
+            _install_vanilla_metric_hooks(
+                self.model,
+                collect_expert_outputs=(
+                    self.collect_expert_output_stats
+                    or self.collect_expert_token_stats))
+        if self.collect_expert_token_stats and not self.collect_routing_trace:
+            raise ValueError(
+                'collect_expert_token_stats=True requires '
+                'collect_routing_trace=True so token responses can be aligned '
+                'with token IDs and expert IDs.')
+        if self.collect_routing_trace:
+            if not self.routing_trace_output_dir:
+                raise ValueError(
+                    'routing_trace_output_dir is required when '
+                    'collect_routing_trace=True')
+            os.makedirs(self.routing_trace_output_dir, exist_ok=True)
+        if self.collect_expert_output_stats:
+            if not self.expert_output_stats_dir:
+                raise ValueError(
+                    'expert_output_stats_dir is required when '
+                    'collect_expert_output_stats=True')
+            os.makedirs(self.expert_output_stats_dir, exist_ok=True)
         assert mode in ['none', 'mid']
         self.mode = mode
         self.logger.info(f'using stop words: {self.stop_words}')
@@ -482,6 +973,25 @@ class BD3withChatTemplate_original(BaseModel):
         for k, v in other_kwargs.items():
             if v is not None:
                 self.logger.warning(f'Unused argument {k}={v}')
+
+    def get_metrics_summary(self):
+        """Return micro-averaged metrics accumulated by this process."""
+        if not self.collect_metrics:
+            return None
+        totals = self._metrics_totals.copy()
+        layer_forwards = totals['layer_forwards']
+        denoising_forwards = totals['denoising_forwards']
+        apf = (totals['activated_experts'] / layer_forwards
+               if layer_forwards else None)
+        tpf = (totals['accepted_tokens'] / denoising_forwards
+               if denoising_forwards else None)
+        totals.update({
+            'method': 'vanilla',
+            'APF': apf,
+            'TPF': tpf,
+            'APT': apf / tpf if apf is not None and tpf else None,
+        })
+        return totals
 
     def _load_tokenizer(self, path: Optional[str], kwargs: dict, pad_token_id: Optional[int] = None):
         from transformers import AutoTokenizer, GenerationConfig
@@ -514,7 +1024,7 @@ class BD3withChatTemplate_original(BaseModel):
         raise ValueError('pad_token_id is not set for this tokenizer. Please set `pad_token_id={PAD_TOKEN_ID}` in model_cfg.')
 
     def _load_model(self, path: str, kwargs: dict, peft_path: Optional[str] = None, peft_kwargs: dict = dict()):
-        from transformers import AutoModel, AutoModelForCausalLM
+        from transformers import AutoModelForCausalLM
 
         DEFAULT_MODEL_KWARGS = dict(device_map='cuda', trust_remote_code=True)
         model_kwargs = DEFAULT_MODEL_KWARGS
@@ -524,11 +1034,9 @@ class BD3withChatTemplate_original(BaseModel):
         if is_npu_available():
             model_kwargs['device_map'] = 'npu'
 
-        try:
-            self.model = AutoModelForCausalLM.from_pretrained(path, **model_kwargs)
-            # self.model = self.model.to(torch.float16)
-        except ValueError:
-            self.model = AutoModel.from_pretrained(path, **model_kwargs)
+        # This wrapper requires vocabulary logits.  Falling back silently to
+        # AutoModel would return hidden states and produce invalid decoding.
+        self.model = AutoModelForCausalLM.from_pretrained(path, **model_kwargs)
 
         if peft_path is not None:
             from peft import PeftModel
@@ -743,6 +1251,7 @@ class BD3withChatTemplate_original(BaseModel):
             messages = [self.tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False) for m in messages]
             tokenize_kwargs['add_special_tokens'] = False
             tokens = self.tokenizer.batch_encode_plus(messages, **tokenize_kwargs)
+        formatted_prompt_text = messages[0] if batch_size == 1 else None
 
         # list of tensors
         # inputs_ids = [torch.tensor(t, device=self.model.device) for t in tokens['input_ids']]
@@ -779,7 +1288,27 @@ class BD3withChatTemplate_original(BaseModel):
             generation_kwargs['min_new_tokens'] = min_out_len
         generation_kwargs['pad_token_id'] = self.tokenizer.pad_token_id
         stopping_criteria_idx = [self.tokenizer.encode(stop, add_special_tokens=False)[0] for stop in stopping_criteria]
-        outputs = block_diffusion_generate(
+        metrics_collector = None
+        if self.collect_metrics:
+            metrics_collector = {
+                'activated_experts': 0,
+                'layer_forwards': 0,
+                'accepted_tokens': 0,
+                'denoising_forwards': 0,
+            }
+            if self.collect_routing_trace:
+                metrics_collector['_trace_enabled'] = True
+                metrics_collector['trace_forwards'] = []
+            if self.collect_expert_output_stats:
+                metrics_collector['_expert_output_enabled'] = True
+                metrics_collector['_expert_output_by_step'] = {}
+                metrics_collector['_expert_output_forward_counts'] = {}
+                metrics_collector['_expert_output_state_token_counts'] = {}
+                metrics_collector['_expert_output_pair_opportunities'] = {}
+            if self.collect_expert_token_stats:
+                metrics_collector['_expert_token_enabled'] = True
+
+        full_outputs = block_diffusion_generate(
             self.model,
             self.tokenizer,
             tokens,
@@ -794,7 +1323,158 @@ class BD3withChatTemplate_original(BaseModel):
             remasking=generation_kwargs['remasking'],
             threshold=generation_kwargs['threshold'],
             stopping_criteria_idx=stopping_criteria_idx,
-            )[:, tokens["input_ids"].shape[1]:]
+            metrics_collector=metrics_collector,
+            )
+        prompt_length = tokens["input_ids"].shape[1]
+        outputs = full_outputs[:, prompt_length:]
+
+        if self.collect_metrics:
+            trace_forwards = metrics_collector.pop('trace_forwards', None)
+            metrics_collector.pop('_trace_enabled', None)
+            expert_output_by_step = metrics_collector.pop(
+                '_expert_output_by_step', None)
+            expert_output_forward_counts = metrics_collector.pop(
+                '_expert_output_forward_counts', None)
+            expert_output_state_token_counts = metrics_collector.pop(
+                '_expert_output_state_token_counts', None)
+            expert_output_pair_opportunities = metrics_collector.pop(
+                '_expert_output_pair_opportunities', None)
+            metrics_collector.pop('_expert_output_enabled', None)
+            metrics_collector.pop('_expert_token_enabled', None)
+            layer_forwards = metrics_collector['layer_forwards']
+            denoising_forwards = metrics_collector['denoising_forwards']
+            accepted_tokens = metrics_collector['accepted_tokens']
+            apf = (metrics_collector['activated_experts'] / layer_forwards
+                   if layer_forwards else None)
+            tpf = (accepted_tokens / denoising_forwards
+                   if denoising_forwards else None)
+            record = {
+                'schema': 'sdar_metrics_v1',
+                'method': 'vanilla',
+                'sequence': self._metrics_sequence,
+                **metrics_collector,
+                'APF': apf,
+                'TPF': tpf,
+                'APT': apf / tpf if apf is not None and tpf else None,
+            }
+            self._metrics_totals['sequences'] += 1
+            for name in (
+                    'activated_experts', 'layer_forwards',
+                    'accepted_tokens', 'denoising_forwards'):
+                self._metrics_totals[name] += int(metrics_collector[name])
+            metrics_file = os.path.join(
+                self.metrics_output_dir,
+                f'vanilla_metrics_pid{os.getpid()}.jsonl')
+            with open(metrics_file, 'a', encoding='utf-8') as file:
+                file.write(json.dumps(record) + '\n')
+
+            if self.collect_routing_trace:
+                if not trace_forwards:
+                    raise RuntimeError(
+                        'Routing trace collection produced no forward records.')
+                trace_file = os.path.join(
+                    self.routing_trace_output_dir,
+                    f'routing_trace_pid{os.getpid()}_sequence'
+                    f'{self._metrics_sequence:06d}.npz')
+                trace_payload = dict(
+                    schema=np.asarray('sdar_vanilla_routing_trace_v2'),
+                    sequence=np.asarray(self._metrics_sequence, dtype=np.int32),
+                    prompt_length=np.asarray(prompt_length, dtype=np.int32),
+                    block_length=np.asarray(
+                        generation_kwargs['block_length'], dtype=np.int16),
+                    state_names=np.asarray([
+                        'prompt', 'generated_decoded', 'masked']),
+                    formatted_prompt_text=np.asarray(
+                        formatted_prompt_text or ''),
+                    final_token_ids=full_outputs[0].detach().to(
+                        device='cpu', dtype=torch.int32).numpy(),
+                    final_generated_text=np.asarray(self.tokenizer.decode(
+                        full_outputs[0, prompt_length:].detach().to(
+                            device='cpu').tolist(),
+                        skip_special_tokens=False)),
+                    block_ids=np.asarray(
+                        [item['block_id'] for item in trace_forwards],
+                        dtype=np.int32),
+                    block_starts=np.asarray(
+                        [item['block_start'] for item in trace_forwards],
+                        dtype=np.int32),
+                    denoising_steps=np.asarray(
+                        [item['denoising_step'] for item in trace_forwards],
+                        dtype=np.int16),
+                    layer_ids=trace_forwards[0]['layer_ids'],
+                    global_positions=np.stack([
+                        item['global_positions'] for item in trace_forwards]),
+                    token_ids_before=np.stack(
+                        [item['token_ids_before'] for item in trace_forwards]),
+                    mask_before=np.stack(
+                        [item['mask_before'] for item in trace_forwards]),
+                    state_before=np.stack(
+                        [item['state_before'] for item in trace_forwards]),
+                    accepted_after=np.stack(
+                        [item['accepted_after'] for item in trace_forwards]),
+                    expert_ids=np.stack(
+                        [item['expert_ids'] for item in trace_forwards]),
+                    routing_weights=np.stack(
+                        [item['routing_weights'] for item in trace_forwards]),
+                )
+                if self.collect_expert_token_stats:
+                    for statistic in (
+                            'input_norm', 'output_norm',
+                            'weighted_output_norm', 'output_input_cosine',
+                            'output_input_norm_ratio'):
+                        trace_payload[f'expert_{statistic}'] = np.stack([
+                            item[f'expert_{statistic}']
+                            for item in trace_forwards
+                        ])
+                np.savez_compressed(
+                    trace_file,
+                    **trace_payload,
+                )
+            if self.collect_expert_output_stats:
+                if not expert_output_by_step:
+                    raise RuntimeError(
+                        'Expert-output collection produced no forward records.')
+                steps = sorted(expert_output_by_step)
+                expert_output_file = os.path.join(
+                    self.expert_output_stats_dir,
+                    f'expert_output_stats_pid{os.getpid()}_sequence'
+                    f'{self._metrics_sequence:06d}.npz')
+                statistic_names = (
+                    'count', 'routing_weight_sum', 'input_norm_sum',
+                    'output_norm_sum', 'weighted_output_norm_sum',
+                    'output_input_cosine_sum',
+                    'output_input_norm_ratio_sum')
+                arrays = {
+                    statistic: np.stack([
+                        expert_output_by_step[step][statistic]
+                        for step in steps
+                    ])
+                    for statistic in statistic_names
+                }
+                np.savez_compressed(
+                    expert_output_file,
+                    schema=np.asarray('sdar_vanilla_expert_output_stats_v1'),
+                    sequence=np.asarray(
+                        self._metrics_sequence, dtype=np.int32),
+                    denoising_steps=np.asarray(steps, dtype=np.int16),
+                    layer_ids=np.arange(
+                        arrays['count'].shape[1], dtype=np.int16),
+                    state_names=np.asarray(['masked', 'decoded']),
+                    forward_counts=np.asarray([
+                        expert_output_forward_counts[step]
+                        for step in steps
+                    ], dtype=np.int32),
+                    state_token_counts=np.stack([
+                        expert_output_state_token_counts[step]
+                        for step in steps
+                    ]),
+                    masked_decoded_pair_opportunities=np.asarray([
+                        expert_output_pair_opportunities[step]
+                        for step in steps
+                    ], dtype=np.int64),
+                    **arrays,
+                )
+            self._metrics_sequence += 1
 
         decodeds = self.tokenizer.batch_decode(outputs, skip_special_tokens=False)
         decodeds = [t.replace('<|MASK|>', '') for t in decodeds]

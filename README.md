@@ -44,7 +44,7 @@ You can choose to directly perform the inference or simultaneously output the in
 Replace the `modeling_sdar_moe.py` in the downloaded model with the `modeling_sdar_moe.py` provided by us. 
 ```
 cd evaluation/opencompass
-CUDA_VISIBLE_DEVICES=<GPU_ID> python run.py configs/eval_sdar_hf_<Task_Name>.py
+CUDA_VISIBLE_DEVICES=<GPU_ID> python run.py configs/sdar/team/eval_sdar_hf_<Task_Name>.py
 ```
 Parameter descriptions:
 - `<GPU_ID>`: Choose which GPU to run on
@@ -53,7 +53,7 @@ Parameter descriptions:
 
 Example:
 ```
-CUDA_VISIBLE_DEVICES=0 python run.py configs/eval_sdar_hf_gsm8k.py
+CUDA_VISIBLE_DEVICES=0 python run.py configs/sdar/team/eval_sdar_hf_gsm8k.py
 ```
 Please make sure to replace the model path in the `model_configs` of `eval_sdar_hf_<Task_Name>.py` with the actual path of your downloaded model before inference.
 
@@ -62,11 +62,11 @@ Please make sure to replace the model path in the `model_configs` of `eval_sdar_
 Replace the `modeling_sdar_moe.py` in the downloaded model with the `modeling_sdar_moe_mark.py` provided by us. 
 ```
 cd evaluation/opencompass
-CUDA_VISIBLE_DEVICES=<GPU_ID> python run.py configs/eval_sdar_hf_<Task_Name>_mark.py
+CUDA_VISIBLE_DEVICES=<GPU_ID> python run.py configs/sdar/team/eval_sdar_hf_<Task_Name>_mark.py
 ```
 Example:
 ```
-CUDA_VISIBLE_DEVICES=0 python run.py configs/eval_sdar_hf_gsm8k_mark.py
+CUDA_VISIBLE_DEVICES=0 python run.py configs/sdar/team/eval_sdar_hf_gsm8k_mark.py
 ```
 Please make sure to replace the model path in the `model_configs` of `eval_sdar_hf_<Task_Name>_mark.py` with the actual path of your downloaded model before inference.
 Please make sure to replace the relevant paths in the `evaluation\opencompass\opencompass\openicl\icl_inferencer\icl_gen_inferencer.py` as needed.
@@ -87,4 +87,3 @@ This repo is largely based on [SDAR](https://github.com/JetAstra/SDAR). We would
 
 ### Contact
 If you have any questions, please contact us via email lywei25@stu.pku.edu.cn.
-

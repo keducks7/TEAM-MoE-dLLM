@@ -178,6 +178,20 @@ class GenInferencer(BaseInferencer):
 
         end_time_stamp = time.time()
 
+        # Model wrappers that collect inference metrics can expose a final
+        # process-local summary.  Printing it here ensures that APF/TPF/APT
+        # are visible after the complete dataset, rather than once per sample.
+        if self.is_main_process:
+            get_metrics_summary = getattr(
+                self.model, 'get_metrics_summary', None)
+            if callable(get_metrics_summary):
+                metrics_summary = get_metrics_summary()
+                if metrics_summary is not None:
+                    logger.info(
+                        'FINAL INFERENCE METRICS\n%s',
+                        json.dumps(metrics_summary, indent=2,
+                                   ensure_ascii=False))
+
         # 6. Output
         if self.is_main_process:
             os.makedirs(output_json_filepath, exist_ok=True)
@@ -426,7 +440,7 @@ class GenInferencer_gsm8k(BaseInferencer):
             # sample_file = os.path.join(test_dir, f"sequence_{idx}.json")
             sample_file_expert_distribution = os.path.join(test_dir_expert_distribution, f"sequence_{idx}.json")
             sample_file_decoded_order = os.path.join(test_dir_decoded_order, f"sequence_{idx}.json")
-            sample_file_hidden_similarity = os.path.join(test_dir_hidden_similarity, f"sequence_{idx}.json")
+            sample_file_hidden_similarity = None
 
             if ds_reader.output_column:
                 entry, golds = list(zip(*datum))
@@ -660,7 +674,7 @@ class GenInferencer_math(BaseInferencer):
             # sample_file = os.path.join(test_dir, f"sequence_{idx}.json")
             sample_file_expert_distribution = os.path.join(test_dir_expert_distribution, f"sequence_{idx}.json")
             sample_file_decoded_order = os.path.join(test_dir_decoded_order, f"sequence_{idx}.json")
-            sample_file_hidden_similarity = os.path.join(test_dir_hidden_similarity, f"sequence_{idx}.json")
+            sample_file_hidden_similarity = None
 
             if ds_reader.output_column:
                 entry, golds = list(zip(*datum))
@@ -894,7 +908,7 @@ class GenInferencer_humaneval(BaseInferencer):
             # sample_file = os.path.join(test_dir, f"sequence_{idx}.json")
             sample_file_expert_distribution = os.path.join(test_dir_expert_distribution, f"sequence_{idx}.json")
             sample_file_decoded_order = os.path.join(test_dir_decoded_order, f"sequence_{idx}.json")
-            sample_file_hidden_similarity = os.path.join(test_dir_hidden_similarity, f"sequence_{idx}.json")
+            sample_file_hidden_similarity = None
 
             if ds_reader.output_column:
                 entry, golds = list(zip(*datum))
@@ -1129,7 +1143,7 @@ class GenInferencer_mbpp(BaseInferencer):
             # sample_file = os.path.join(test_dir, f"sequence_{idx}.json")
             sample_file_expert_distribution = os.path.join(test_dir_expert_distribution, f"sequence_{idx}.json")
             sample_file_decoded_order = os.path.join(test_dir_decoded_order, f"sequence_{idx}.json")
-            sample_file_hidden_similarity = os.path.join(test_dir_hidden_similarity, f"sequence_{idx}.json")
+            sample_file_hidden_similarity = None
 
             if ds_reader.output_column:
                 entry, golds = list(zip(*datum))
@@ -1235,5 +1249,4 @@ class GenInferencer_mbpp(BaseInferencer):
                         prompt, mode='gen')
             prompt_list.append(prompt)
         return prompt_list
-
 
