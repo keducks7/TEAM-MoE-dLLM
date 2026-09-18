@@ -284,7 +284,7 @@ class SDARMoeSparseMoeBlock(nn.Module):
                 decoded_index=None, expert_limit_index=None,
                 cold_expert_budget: int = 0,
                 cold_expert_selection: str = "probability_sum",
-                cold_reuse_mask=None, hot_mask=None,
+                cold_reuse_mask=None, cold_zero_mask=None, hot_mask=None,
                 hot_prune_count: int = 0, hot_protect_top1: bool = True) -> torch.Tensor:
         # """ """
         # batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -388,6 +388,8 @@ class SDARMoeSparseMoeBlock(nn.Module):
             compute_mask = ~decoded_index  # True表示需要计算的位置
             if cold_reuse_mask is not None:
                 compute_mask = compute_mask & ~cold_reuse_mask
+            if cold_zero_mask is not None:
+                compute_mask = compute_mask & ~cold_zero_mask
             
             # 展平张量
             hidden_states_flat = hidden_states.view(-1, hidden_dim)
@@ -404,6 +406,8 @@ class SDARMoeSparseMoeBlock(nn.Module):
             
             # 对于不需要计算的位置，直接使用past_hidden_states
             final_hidden_states[~compute_mask_flat] = past_hidden_states_flat[~compute_mask_flat]
+            if cold_zero_mask is not None:
+                final_hidden_states[cold_zero_mask.reshape(-1)] = 0
             
             # 只对需要计算的位置执行MoE计算
             if compute_mask_flat.any():
@@ -729,6 +733,12 @@ class SDARMoeDecoderLayer(nn.Module):
             selected_hidden_states = past_hidden_states[:, start_idx:end_idx, :]
             # 将选中的序列复制 4 次
             past_hidden_states = torch.tile(selected_hidden_states, (1, 4, 1))
+            active_indices = kwargs.get('team_active_indices')
+            full_cache = None
+            if active_indices is not None:
+                # Cache remains in the original four-branch coordinates.
+                full_cache = torch.zeros_like(past_hidden_states)
+                past_hidden_states = past_hidden_states.index_select(1, active_indices)
             hidden_states = self.mlp(
                 hidden_states,
                 past_hidden_states,
@@ -737,6 +747,7 @@ class SDARMoeDecoderLayer(nn.Module):
                 cold_expert_budget,
                 cold_expert_selection,
                 cold_reuse_mask=kwargs.get('cold_reuse_mask'),
+                cold_zero_mask=kwargs.get('cold_zero_mask'),
                 hot_mask=kwargs.get('hot_mask'),
                 hot_prune_count=kwargs.get('hot_prune_count', 0),
                 hot_protect_top1=kwargs.get('hot_protect_top1', True))
@@ -749,6 +760,9 @@ class SDARMoeDecoderLayer(nn.Module):
             router_logits = None
 
         current_hidden_state = hidden_states
+        if past_hidden_states is not None and full_cache is not None:
+            full_cache.index_copy_(1, active_indices, current_hidden_state)
+            current_hidden_state = full_cache
         hidden_states = residual + hidden_states
 
         # Return the cached MLP output explicitly. Accelerate copies mutable
@@ -937,6 +951,10 @@ class SDARMoeModel(SDARMoePreTrainedModel):
         past_hidden_states = None
 
         for idx, decoder_layer in enumerate(self.layers):
+            layer_kwargs = dict(flash_attn_kwargs)
+            schedule = layer_kwargs.pop('hot_prune_schedule', None)
+            if schedule is not None:
+                layer_kwargs['hot_prune_count'] = schedule[min(2, idx * 3 // len(self.layers))]
             if stored_hidden_states is not None:
                 past_hidden_states = stored_hidden_states[idx]
 
@@ -974,7 +992,7 @@ class SDARMoeModel(SDARMoePreTrainedModel):
                     choice_id = choice_id,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
-                    **flash_attn_kwargs,
+                    **layer_kwargs,
                 )
 
             hidden_states = layer_outputs[0]

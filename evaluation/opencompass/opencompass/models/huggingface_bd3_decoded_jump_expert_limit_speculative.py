@@ -196,6 +196,28 @@ def get_num_transfer_tokens(block_length, steps):
 
     return num_transfer_tokens
 
+def _pack_team_positions(kwargs, skip_mask):
+    """Remove skipped positions, preserving RoPE IDs and cached-prefix keys."""
+    if skip_mask.shape[0] != 1:
+        raise ValueError('Cold full skip currently supports batch size 1 only')
+    active = torch.where(~skip_mask[0])[0]
+    if active.numel() == 0:
+        raise ValueError('Cannot skip all TEAM positions')
+    packed = dict(kwargs)
+    length = skip_mask.shape[1]
+    attention = kwargs['attention_mask']
+    prefix = attention.shape[-1] - length
+    keys = torch.cat((torch.arange(prefix, device=active.device), prefix + active))
+    packed['attention_mask'] = attention.index_select(-2, active).index_select(-1, keys)
+    for name in ('input_ids', 'position_ids', 'decoded_index', 'expert_limit_index',
+                 'hot_mask', 'cold_reuse_mask', 'cold_zero_mask'):
+        if packed.get(name) is not None:
+            packed[name] = packed[name].index_select(1, active)
+    packed['cache_position'] = packed['cache_position'].index_select(0, active)
+    packed['team_active_indices'] = active
+    return packed, active
+
+
 @torch.no_grad()
 def block_diffusion_generate(
     model,
@@ -219,6 +241,8 @@ def block_diffusion_generate(
     cold_reuse_interval=0,
     hot_prune_count=0,
     hot_protect_top1=True,
+    cold_strategy='none',
+    hot_prune_schedule=None,
     metrics_collector=None):
     '''
     Args:
@@ -265,6 +289,9 @@ def block_diffusion_generate(
     x = torch.full((input_ids.shape[0], total_length),
                    mask_id, dtype=torch.long).to(model.device)
     x[:, :input_ids.shape[1]] = input_ids.clone()
+
+    if cold_strategy == 'full_skip' and (block_length != 32 or x.shape[0] != 1):
+        raise ValueError('full_skip requires TEAM block_length=32 and batch_size=1')
 
     # calculate prefill_length
     prefill_blocks = input_ids.shape[1] // block_length
@@ -474,27 +501,28 @@ def block_diffusion_generate(
                         parent_cold = previous_cold.view(4, block_length)[choice_id]
                         reuse_mask = cold_now & parent_cold.repeat(1, 4)
                     previous_cold = cold_now
+                    skip_mask = cold_now if cold_strategy == 'full_skip' else None
+                    forward_kwargs = dict(
+                        input_ids=speculative_blocks, attention_mask=spec_attn_mask,
+                        position_ids=spec_position_ids, past_key_values=past_key_values,
+                        use_cache=True, store_kv=False, stored_hidden_states=stored_hidden_states,
+                        decoded_index=spec_decoded_index, expert_limit_index=expert_limit_index,
+                        cold_expert_budget=cold_expert_budget,
+                        cold_expert_selection=cold_expert_selection,
+                        cold_reuse_mask=reuse_mask,
+                        cold_zero_mask=cold_now if cold_strategy == 'moe_zero' else None,
+                        hot_mask=spec_mask_index & ~expert_limit_index,
+                        hot_prune_count=hot_prune_count, hot_prune_schedule=hot_prune_schedule,
+                        hot_protect_top1=hot_protect_top1, choice_id=choice_id,
+                        cache_position=spec_cache_position)
+                    active = None
+                    if skip_mask is not None:
+                        forward_kwargs, active = _pack_team_positions(forward_kwargs, skip_mask)
 
                     model_output, new_hidden_states = _team_denoising_forward(
                         model,
                         metrics_collector,
-                        input_ids=speculative_blocks,
-                        attention_mask=spec_attn_mask,
-                        position_ids=spec_position_ids,
-                        past_key_values=past_key_values,
-                        use_cache=True,
-                        store_kv=False,
-                        stored_hidden_states=stored_hidden_states,
-                        decoded_index=spec_decoded_index,
-                        expert_limit_index=expert_limit_index,
-                        cold_expert_budget=cold_expert_budget,
-                        cold_expert_selection=cold_expert_selection,
-                        cold_reuse_mask=reuse_mask,
-                        hot_mask=spec_mask_index & ~expert_limit_index,
-                        hot_prune_count=hot_prune_count,
-                        hot_protect_top1=hot_protect_top1,
-                        choice_id=choice_id,
-                        cache_position=spec_cache_position)
+                        **forward_kwargs)
                     
                     logits = model_output.logits
                     stored_hidden_states = new_hidden_states
@@ -503,7 +531,7 @@ def block_diffusion_generate(
                     #     logits, temperature=temperature)
                     # x0 = torch.argmax(logits_with_noise, dim=-1)
 
-                    spec_logits = logits.view(4, 32, -1)
+                    spec_logits = logits.view(4, 32, -1) if active is None else logits
                     spec_x = speculative_blocks.view(4, 32)
                     spec_mask_index_reshaped = spec_mask_index.view(4, 32)
                     if remasking == 'low_confidence':
@@ -516,6 +544,16 @@ def block_diffusion_generate(
                             top_k=top_k,
                             top_p=top_p
                         )
+                        if active is not None:
+                            # Skipped positions retain mask and previous confidence;
+                            # they are NOT eligible for acceptance in this forward.
+                            restored_x = speculative_blocks.clone()
+                            restored_p = x0_p.repeat(1, 4).clone()
+                            restored_x.index_copy_(1, active, spec_x0.reshape(1, -1))
+                            restored_p.index_copy_(1, active, spec_x0_p.reshape(1, -1))
+                            spec_x0 = restored_x.view(4, 32)
+                            spec_x0_p = restored_p.view(4, 32)
+                            spec_mask_index_reshaped = spec_mask_index_reshaped & ~skip_mask.view(4, 32)
                         # x0, x0_p = sample_with_greedy(logits)
                     # elif remasking == 'random':
                     #     x0 = torch.argmax(logits_with_noise, dim=-1)
@@ -543,7 +581,8 @@ def block_diffusion_generate(
                                 spec_transfer_index[j] = high_conf_mask
                             else:
                                 # 当高置信度tokens数量不够时，直接简单地从整体confidence中选取topk即可
-                                _, idx = torch.topk(spec_confidence[j], num_transfer_tokens[i])
+                                k = min(int(num_transfer_tokens[i]), int(valid_positions.sum()))
+                                _, idx = torch.topk(spec_confidence[j], k)
                                 spec_transfer_index[j, idx] = True
                     
                     # else:
@@ -1132,6 +1171,21 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
         cold_reuse_interval = generation_kwargs.get('cold_reuse_interval', 0)
         hot_prune_count = generation_kwargs.get('hot_prune_count', 0)
         hot_protect_top1 = generation_kwargs.get('hot_protect_top1', True)
+        cold_strategy = generation_kwargs.get('cold_strategy', 'none')
+        hot_prune_schedule = generation_kwargs.get('hot_prune_schedule')
+        if cold_strategy not in {'none', 'reuse', 'moe_zero', 'full_skip'}:
+            raise ValueError('Unknown cold_strategy')
+        if cold_strategy == 'reuse' and cold_reuse_interval < 2:
+            raise ValueError('reuse requires cold_reuse_interval >= 2')
+        if cold_strategy in {'moe_zero', 'full_skip'} and cold_reuse_interval != 0:
+            raise ValueError('Cold skip and reuse cannot be combined')
+        if cold_strategy == 'full_skip' and generation_kwargs['threshold'] >= 1:
+            raise ValueError('full_skip requires dynamic acceptance threshold < 1')
+        if hot_prune_schedule is not None:
+            if (not isinstance(hot_prune_schedule, (list, tuple))
+                    or len(hot_prune_schedule) != 3
+                    or any(type(v) is not int or v < 0 for v in hot_prune_schedule)):
+                raise ValueError('hot_prune_schedule must contain three non-negative integers')
         for name, value in [('cold_reuse_interval', cold_reuse_interval),
                             ('hot_prune_count', hot_prune_count)]:
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -1197,6 +1251,8 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
             cold_reuse_interval=cold_reuse_interval,
             hot_prune_count=hot_prune_count,
             hot_protect_top1=hot_protect_top1,
+            cold_strategy=cold_strategy,
+            hot_prune_schedule=hot_prune_schedule,
             metrics_collector=metrics_collector,
             )[:, tokens["input_ids"].shape[1]:]
 
