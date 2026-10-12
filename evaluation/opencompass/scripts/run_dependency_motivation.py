@@ -9,6 +9,16 @@ import random
 import sys
 
 
+def validate_gpu_count(requested, available, visible):
+    """Reject unavailable logical CUDA IDs before allocating model weights."""
+    if requested > available:
+        raise ValueError(
+            f'Requested {requested} GPUs, but this process sees {available}; '
+            f'CUDA_VISIBLE_DEVICES={visible!r}. For two physical GPUs 0 and 1, '
+            'set CUDA_VISIBLE_DEVICES=0,1 and MODEL_GPUS=2 together. '
+            'max_memory uses logical IDs 0..N-1, not physical GPU IDs.')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', choices=['humaneval', 'mbpp'], default='humaneval')
@@ -31,9 +41,15 @@ def main():
     os.chdir(root)
     sys.path.insert(0, str(root))
     args.output_dir = args.output_dir.resolve()
-    args.output_dir.mkdir(parents=True, exist_ok=False)
     import numpy as np
     import torch
+    if not args.dry_run:
+        try:
+            validate_gpu_count(args.gpus, torch.cuda.device_count(),
+                               os.environ.get('CUDA_VISIBLE_DEVICES'))
+        except ValueError as error:
+            parser.error(str(error))
+    args.output_dir.mkdir(parents=True, exist_ok=False)
     from mmengine.config import Config
     from opencompass.cli import main as cli
     random.seed(args.seed)

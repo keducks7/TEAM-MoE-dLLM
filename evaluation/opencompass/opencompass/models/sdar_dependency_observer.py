@@ -14,11 +14,24 @@ import torch
 from torch.nn import functional as F
 
 
+def _attention_implementation(module):
+    """Find class-defined attention, independent of Accelerate's forward wrapper.
+
+    device_map dispatch can replace the instance forward with functools.partial.
+    The class implementation still provides SDAR's source and RoPE globals.
+    Never replace the executed forward or remove its device-management hooks.
+    """
+    implementation = inspect.unwrap(type(module).forward)
+    if not inspect.isfunction(implementation):
+        raise RuntimeError('Unsupported attention: cannot inspect class forward')
+    return implementation
+
+
 def reconstruct_attention(module, query, key, kwargs):
     """Head-mean current-block attention with the FULL prefix denominator."""
     if module.training or getattr(module, 'attention_dropout', 0) != 0:
         raise ValueError('Dependency observations require eval and zero attention dropout')
-    rotary = module.forward.__globals__.get('apply_rotary_pos_emb')
+    rotary = _attention_implementation(module).__globals__.get('apply_rotary_pos_emb')
     if rotary is None:
         raise RuntimeError('Unsupported attention: cannot locate apply_rotary_pos_emb')
     query = query.transpose(1, 2)
@@ -77,7 +90,7 @@ class DependencyObserver:
             layer = decoder_layers[layer_id]
             attn, moe = layer.self_attn, layer.mlp
             # Fail explicitly rather than silently observe incompatible remote code.
-            source = inspect.getsource(attn.forward)
+            source = inspect.getsource(_attention_implementation(attn))
             if 'scaled_dot_product_attention' not in source:
                 raise RuntimeError('This observer supports SDAR SDPA attention only')
             if 'attention_mask.bool()' not in source:

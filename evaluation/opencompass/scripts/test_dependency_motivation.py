@@ -1,5 +1,6 @@
 """NumPy tests plus optional CPU PyTorch observation/parity tests."""
 import importlib.util
+from functools import partial
 import json
 from pathlib import Path
 import tempfile
@@ -22,6 +23,19 @@ def load_module(name, path):
 
 
 analysis = load_module('dependency_analysis', ROOT / 'analysis/tools/analyze_dependency_motivation.py')
+runner = load_module('dependency_runner', ROOT / 'scripts/run_dependency_motivation.py')
+
+
+class GPUConfigTests(unittest.TestCase):
+    def test_two_visible_gpus(self):
+        runner.validate_gpu_count(2, 2, '0,1')
+
+    def test_physical_ids_are_remapped(self):
+        runner.validate_gpu_count(2, 2, '2,3')
+
+    def test_missing_second_gpu_fails_early(self):
+        with self.assertRaisesRegex(ValueError, 'sees 1'):
+            runner.validate_gpu_count(2, 1, '0')
 
 
 def fixture(path, gap=False):
@@ -171,8 +185,25 @@ if torch is not None:
 @unittest.skipIf(torch is None, 'PyTorch not installed; run this suite on server for hook parity')
 class HookTests(unittest.TestCase):
     def test_outputs_rng_and_cache_unchanged_and_prefix_denominator(self):
+        self._check_parity(wrapped=False)
+
+    def test_partial_wrapped_forward_parity(self):
+        self._check_parity(wrapped=True)
+
+    def _check_parity(self, wrapped):
         torch.manual_seed(4)
         model = ToyModel().eval()
+        if wrapped:
+            attention = model.model.layers[0].self_attn
+            attention._old_forward = attention.forward
+
+            def new_forward(module, *args, **kwargs):
+                return module._old_forward(*args, **kwargs)
+
+            # Mimic Accelerate dispatch: __globals__ and getsource on the
+            # instance forward are unavailable, but the class is unchanged.
+            attention.forward = partial(new_forward, attention)
+            self.assertFalse(hasattr(attention.forward, '__globals__'))
         x = torch.randn(1, 8, 8)
         prefix = torch.randn(1, 1, 3, 4)
         cache = [(prefix, prefix.clone())]

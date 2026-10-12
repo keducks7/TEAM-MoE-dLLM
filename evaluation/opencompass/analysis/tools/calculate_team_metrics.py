@@ -6,6 +6,13 @@ decoded-order JSON file per generated sequence.  APF is the mean number of
 distinct, actually activated experts (expert id != -1) per MoE layer and
 forward pass.  TPF is the mean number of accepted tokens per forward pass.
 APT is APF / TPF, matching the definition used in the TEAM paper.
+
+For original TEAM Mark records, transfer_index omits verified speculative
+prefills. By default, reconstruct mask-to-token transitions from the next
+forward's delayed-cache (-1) markers. This requires the original four-branch
+Mark layout and completed blocks. Use --accepted-token-mode transfer for the
+old counting rule or other record formats. Compact JSONL totals are unchanged;
+missing speculative counts cannot be recovered from those totals alone.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ class MetricTotals:
     expert_forwards: int = 0
     accepted_tokens: int = 0
     decoded_forwards: int = 0
+    transfer_accepted_tokens: int = 0
 
     @property
     def apf(self) -> float:
@@ -109,7 +117,115 @@ def count_accepted_tokens(payload: dict[str, Any], totals: MetricTotals) -> None
                 raise ValueError(
                     f"transfer_index at {block}/{step} contains a non-boolean value")
             totals.accepted_tokens += sum(transfer_index)
+            totals.transfer_accepted_tokens += sum(transfer_index)
             totals.decoded_forwards += 1
+
+
+def recover_team_accepted_tokens(
+    expert_payload: dict[str, Any],
+    decoded_payload: dict[str, Any],
+    block_length: int,
+    denoising_steps: int,
+) -> int:
+    """Recover accepted tokens for the original BS=1 four-branch Mark loop.
+
+    At forward j+1 the cached positions are precisely the non-mask positions
+    after forward j, excluding j's transfer_index. Thus their union restores
+    the selected branch's state, including its verified speculative prefills.
+    The last state is a complete block: in the original loop, fewer than
+    denoising_steps+1 recorded steps implies exit through the no-mask check.
+    This is NOT suitable for full_skip, cache refresh, or partial run logs.
+    """
+    if block_length <= 0 or not 0 < denoising_steps <= block_length:
+        raise ValueError('Require 0 < denoising_steps <= block_length')
+    if block_length % denoising_steps:
+        raise ValueError('block_length must be divisible by denoising_steps')
+    if not decoded_payload or forward_keys(expert_payload) != forward_keys(decoded_payload):
+        raise ValueError('TEAM recovery requires matching, nonempty forward records')
+    block_keys = sorted(decoded_payload, key=numeric_key)
+    if block_keys != [str(i) for i in range(len(block_keys))]:
+        raise ValueError('TEAM recovery requires contiguous blocks starting at 0')
+    all_positions = set(range(block_length))
+    accepted = 0
+    expected_layers: set[str] | None = None
+    for block in block_keys:
+        steps = decoded_payload[block]
+        keys = sorted(steps, key=numeric_key)
+        if not keys or keys != [str(i) for i in range(len(keys))]:
+            raise ValueError(f'Non-contiguous TEAM steps in block {block}')
+        if len(keys) >= denoising_steps + 1:
+            raise ValueError(
+                f'Block {block} may be incomplete (step limit reached); '
+                'cannot infer its final state. Check --denoising-steps or '
+                'use --accepted-token-mode transfer for the old count.')
+        transfers: list[set[int]] = []
+        caches: list[set[int]] = []
+        for index, step in enumerate(keys):
+            record = steps[step]
+            transfer = record.get('transfer_index') if isinstance(record, dict) else None
+            if (not isinstance(transfer, list) or len(transfer) != 1
+                    or not isinstance(transfer[0], list)
+                    or len(transfer[0]) != block_length
+                    or any(not isinstance(x, bool) for x in transfer[0])):
+                raise ValueError(f'Expected BS=1 transfer_index at {block}/{step}')
+            transfers.append({i for i, flag in enumerate(transfer[0]) if flag})
+            layers = expert_payload[block][step]
+            if not isinstance(layers, dict) or not layers:
+                raise ValueError(f'Missing expert layers at {block}/{step}')
+            if expected_layers is None:
+                expected_layers = set(layers)
+            if set(layers) != expected_layers:
+                raise ValueError(f'MoE layer keys differ at {block}/{step}')
+            if index == 0:
+                caches.append(set())
+                continue
+            layer_cache = None
+            for layer, rows in layers.items():
+                # Accept both [4*L, K] and [1, 4*L, K] serialization.
+                if (isinstance(rows, list) and len(rows) == 1
+                        and isinstance(rows[0], list) and rows[0]
+                        and isinstance(rows[0][0], list)):
+                    rows = rows[0]
+                if not isinstance(rows, list) or len(rows) != 4 * block_length:
+                    raise ValueError(f'Expected four-branch experts at {block}/{step}/{layer}')
+                flags = []
+                width = None
+                for row in rows:
+                    if (not isinstance(row, list) or not row
+                            or any(isinstance(x, bool) or not isinstance(x, int)
+                                   or x < -1 for x in row)):
+                        raise ValueError(f'Invalid expert row at {block}/{step}/{layer}')
+                    if width is None:
+                        width = len(row)
+                    if len(row) != width or (any(x == -1 for x in row)
+                                              and not all(x == -1 for x in row)):
+                        raise ValueError(f'Inconsistent expert row at {block}/{step}/{layer}')
+                    flags.append(all(x == -1 for x in row))
+                if any(flags[b * block_length:(b + 1) * block_length]
+                       != flags[:block_length] for b in range(1, 4)):
+                    raise ValueError(f'Branch cache masks differ at {block}/{step}/{layer}')
+                current = {i for i, flag in enumerate(flags[:block_length]) if flag}
+                if layer_cache is not None and current != layer_cache:
+                    raise ValueError(f'Layer cache masks differ at {block}/{step}')
+                layer_cache = current
+            caches.append(layer_cache)
+            if caches[-1] & (transfers[index] | transfers[index - 1]):
+                raise ValueError(f'Cached and fresh positions overlap at {block}/{step}')
+        # At step 1, only the prompt tail predates step 0's transfers.
+        before = caches[1] if len(keys) > 1 else all_positions - transfers[0]
+        if before != set(range(len(before))) or (block != '0' and before):
+            raise ValueError(f'Invalid initial prompt-tail cache in block {block}')
+        for index, step in enumerate(keys):
+            after = (caches[index + 1] | transfers[index]
+                     if index + 1 < len(keys) else all_positions)
+            if not before <= after or transfers[index] & before:
+                raise ValueError(f'Non-monotonic decode state at {block}/{step}')
+            extra = len(after - before) - len(transfers[index])
+            if extra not in (0, 1, 2) or (index == 0 and extra != 0):
+                raise ValueError(f'Invalid speculative acceptance count at {block}/{step}: {extra}')
+            accepted += len(after - before)
+            before = after
+    return accepted
 
 
 def find_json_files(directory: Path, pattern: str) -> list[Path]:
@@ -140,6 +256,9 @@ def calculate(
     expert_dir: Path,
     decoded_dir: Path,
     pattern: str,
+    accepted_token_mode: str = 'team-mark',
+    block_length: int = 32,
+    denoising_steps: int = 32,
 ) -> tuple[MetricTotals, list[str], int, int]:
     expert_files = find_json_files(expert_dir, pattern)
     decoded_files = find_json_files(decoded_dir, pattern)
@@ -156,26 +275,36 @@ def calculate(
         warnings.append(
             f"{len(only_decoded)} sequence file(s) exist only in the decoded directory")
 
+    if accepted_token_mode not in {'team-mark', 'transfer'}:
+        raise ValueError(f'Unknown accepted token mode: {accepted_token_mode}')
+    if accepted_token_mode == 'team-mark' and (only_expert or only_decoded):
+        raise ValueError('TEAM recovery requires matching expert/decoded files')
     totals = MetricTotals()
-    expert_payloads: dict[Path, dict[str, Any]] = {}
-    decoded_payloads: dict[Path, dict[str, Any]] = {}
-
-    for relative_path, path in expert_map.items():
-        payload = load_json(path)
-        expert_payloads[relative_path] = payload
-        count_experts(payload, totals)
-    for relative_path, path in decoded_map.items():
-        payload = load_json(path)
-        decoded_payloads[relative_path] = payload
-        count_accepted_tokens(payload, totals)
-
-    for relative_path in sorted(set(expert_map) & set(decoded_map)):
-        expert_keys = forward_keys(expert_payloads[relative_path])
-        decoded_keys = forward_keys(decoded_payloads[relative_path])
+    # Stream one sequence pair at a time; expert dumps can occupy many GB.
+    for relative_path in sorted(set(expert_map) | set(decoded_map)):
+        expert = load_json(expert_map[relative_path]) if relative_path in expert_map else None
+        decoded = load_json(decoded_map[relative_path]) if relative_path in decoded_map else None
+        if expert is not None:
+            count_experts(expert, totals)
+        if decoded is not None:
+            count_accepted_tokens(decoded, totals)
+        if expert is None or decoded is None:
+            continue
+        expert_keys = forward_keys(expert)
+        decoded_keys = forward_keys(decoded)
         if expert_keys != decoded_keys:
             warnings.append(
                 f"Forward records differ for {relative_path}: "
                 f"expert={len(expert_keys)}, decoded={len(decoded_keys)}")
+        if accepted_token_mode == 'team-mark':
+            try:
+                recovered = recover_team_accepted_tokens(
+                    expert, decoded, block_length, denoising_steps)
+            except ValueError as error:
+                raise ValueError(f'Cannot recover {relative_path}: {error}') from error
+            recorded = sum(sum(leaf_values(record['transfer_index']))
+                           for steps in decoded.values() for record in steps.values())
+            totals.accepted_tokens += recovered - recorded
 
     if totals.expert_forwards != totals.decoded_forwards:
         warnings.append(
@@ -245,6 +374,15 @@ def parse_args() -> argparse.Namespace:
         default="sequence_*.json",
         help="Recursive input filename glob (default: sequence_*.json).")
     parser.add_argument(
+        '--accepted-token-mode', choices=('team-mark', 'transfer'), default='team-mark',
+        help=('Mark JSON only: recover verified speculative tokens from original '
+              'four-branch delayed-cache records (default: team-mark), or count '
+              'transfer_index only (transfer). Not applicable to compact JSONL.'))
+    parser.add_argument('--block-length', type=int, default=32,
+                        help='Original TEAM Mark block length (default: 32).')
+    parser.add_argument('--denoising-steps', type=int, default=32,
+                        help='Original TEAM Mark denoising_steps (default: 32).')
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Print machine-readable JSON instead of a text report.")
@@ -273,7 +411,8 @@ def main() -> int:
                     '--decoded-dir are required')
             totals, warnings, expert_files, decoded_files = calculate(
                 args.expert_dir.resolve(), args.decoded_dir.resolve(),
-                args.pattern)
+                args.pattern, args.accepted_token_mode,
+                args.block_length, args.denoising_steps)
             metric_files = None
             metric_records = None
         result = {
@@ -290,6 +429,11 @@ def main() -> int:
         if metric_files is not None:
             result['metric_files'] = metric_files
             result['metric_records'] = metric_records
+        else:
+            result['accepted_token_mode'] = args.accepted_token_mode
+            result['transfer_accepted_tokens'] = totals.transfer_accepted_tokens
+            result['recovered_speculative_tokens'] = (
+                totals.accepted_tokens - totals.transfer_accepted_tokens)
     except ValueError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -310,6 +454,10 @@ def main() -> int:
         print(f"Expert forwards   : {totals.expert_forwards}")
         print(f"Decoded forwards  : {totals.decoded_forwards}")
         print(f"Accepted tokens   : {totals.accepted_tokens}")
+        if metric_files is None:
+            print(f"Accepted mode     : {args.accepted_token_mode}")
+            print(f"Transfer tokens   : {totals.transfer_accepted_tokens}")
+            print(f"Recovered spec.   : {result['recovered_speculative_tokens']}")
 
     for warning in warnings:
         print(f"warning: {warning}", file=sys.stderr)
