@@ -400,7 +400,8 @@ def block_diffusion_generate(
     remasking='low_confidence',
     threshold=1.0,
     stopping_criteria_idx=None,
-    metrics_collector=None):
+    metrics_collector=None,
+    dependency_observer=None):
     '''
     Args:
         model: Mask predictor.
@@ -481,6 +482,9 @@ def block_diffusion_generate(
                     store_kv=True)
                 break
             else:
+                if dependency_observer is not None:
+                    dependency_observer.begin_step(
+                        num_block, i, cur_position_ids, cur_x, mask_index)
                 if metrics_collector is not None:
                     metrics_collector['_active_expert_counts'] = []
                     if metrics_collector.get('_trace_enabled', False):
@@ -511,6 +515,8 @@ def block_diffusion_generate(
                         use_cache=True,
                         store_kv=False)
                 finally:
+                    if dependency_observer is not None:
+                        dependency_observer.end_forward()
                     if metrics_collector is not None:
                         model._sdar_metrics_collector = None
                 logits = _extract_causal_lm_logits(model_output, model)
@@ -708,6 +714,8 @@ def block_diffusion_generate(
                             confidence[j], k=num_transfer_tokens[i])
                         transfer_index[j, select_index] = True
 
+                if dependency_observer is not None:
+                    dependency_observer.finish_step(x0, x0_p, transfer_index)
                 cur_x[transfer_index] = x0[transfer_index]
                 if metrics_collector is not None:
                     metrics_collector['accepted_tokens'] += int(
@@ -909,6 +917,10 @@ class BD3withChatTemplate_original(BaseModel):
                  collect_expert_output_stats: bool = False,
                  expert_output_stats_dir: Optional[str] = None,
                  collect_expert_token_stats: bool = False,
+                 collect_dependency_trace: bool = False,
+                 dependency_trace_output_dir: Optional[str] = None,
+                 dependency_layers: str = 'auto',
+                 dependency_max_blocks: int = 8,
                  **other_kwargs):
 
         self.logger = get_logger()
@@ -927,6 +939,14 @@ class BD3withChatTemplate_original(BaseModel):
         self.collect_expert_output_stats = collect_expert_output_stats
         self.expert_output_stats_dir = expert_output_stats_dir
         self.collect_expert_token_stats = collect_expert_token_stats
+        self.dependency_observer = None
+        if collect_dependency_trace:
+            if tokenizer_only or not dependency_trace_output_dir:
+                raise ValueError('Dependency tracing requires a model and output directory')
+            from .sdar_dependency_observer import DependencyObserver
+            self.dependency_observer = DependencyObserver(
+                self.model, dependency_trace_output_dir,
+                dependency_layers, dependency_max_blocks)
         self.collect_metrics = (
             collect_metrics or collect_routing_trace
             or collect_expert_output_stats or collect_expert_token_stats)
@@ -1308,6 +1328,14 @@ class BD3withChatTemplate_original(BaseModel):
             if self.collect_expert_token_stats:
                 metrics_collector['_expert_token_enabled'] = True
 
+        if self.dependency_observer is not None:
+            if generation_kwargs['remasking'] != 'low_confidence':
+                raise ValueError('Dependency pilot requires low_confidence remasking')
+            self.dependency_observer.start_sequence(
+                tokens['input_ids'], self.path, generation_kwargs['threshold'],
+                {key: generation_kwargs[key] for key in (
+                    'gen_length', 'block_length', 'denoising_steps',
+                    'temperature', 'top_k', 'top_p', 'remasking', 'mask_id')})
         full_outputs = block_diffusion_generate(
             self.model,
             self.tokenizer,
@@ -1324,7 +1352,10 @@ class BD3withChatTemplate_original(BaseModel):
             threshold=generation_kwargs['threshold'],
             stopping_criteria_idx=stopping_criteria_idx,
             metrics_collector=metrics_collector,
+            dependency_observer=self.dependency_observer,
             )
+        if self.dependency_observer is not None:
+            self.dependency_observer.finish_sequence()
         prompt_length = tokens["input_ids"].shape[1]
         outputs = full_outputs[:, prompt_length:]
 

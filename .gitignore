@@ -214,3 +214,4 @@ __marimo__/
 !/evaluation/opencompass/analysis/tools/
 /evaluation/opencompass/analysis/tools/*
 !/evaluation/opencompass/analysis/tools/calculate_team_metrics.py
+!/evaluation/opencompass/analysis/tools/analyze_dependency_motivation.py
