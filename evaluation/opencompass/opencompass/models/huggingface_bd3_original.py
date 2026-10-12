@@ -401,7 +401,8 @@ def block_diffusion_generate(
     threshold=1.0,
     stopping_criteria_idx=None,
     metrics_collector=None,
-    dependency_observer=None):
+    dependency_observer=None,
+    dependency_probe=None):
     '''
     Args:
         model: Mask predictor.
@@ -716,6 +717,14 @@ def block_diffusion_generate(
 
                 if dependency_observer is not None:
                     dependency_observer.finish_step(x0, x0_p, transfer_index)
+                if dependency_probe is not None:
+                    dependency_probe.run(
+                        dependency_observer,
+                        dict(input_ids=cur_x, attention_mask=cur_attn_mask,
+                             position_ids=cur_position_ids, past_key_values=past_key_values,
+                             use_cache=True, store_kv=False),
+                        logits, _extract_causal_lm_logits, threshold,
+                        int(num_transfer_tokens[i]))
                 cur_x[transfer_index] = x0[transfer_index]
                 if metrics_collector is not None:
                     metrics_collector['accepted_tokens'] += int(
@@ -921,6 +930,8 @@ class BD3withChatTemplate_original(BaseModel):
                  dependency_trace_output_dir: Optional[str] = None,
                  dependency_layers: str = 'auto',
                  dependency_max_blocks: int = 8,
+                 dependency_probe_output_dir: Optional[str] = None,
+                 dependency_probe_options: Optional[dict] = None,
                  **other_kwargs):
 
         self.logger = get_logger()
@@ -940,6 +951,7 @@ class BD3withChatTemplate_original(BaseModel):
         self.expert_output_stats_dir = expert_output_stats_dir
         self.collect_expert_token_stats = collect_expert_token_stats
         self.dependency_observer = None
+        self.dependency_probe = None
         if collect_dependency_trace:
             if tokenizer_only or not dependency_trace_output_dir:
                 raise ValueError('Dependency tracing requires a model and output directory')
@@ -947,6 +959,14 @@ class BD3withChatTemplate_original(BaseModel):
             self.dependency_observer = DependencyObserver(
                 self.model, dependency_trace_output_dir,
                 dependency_layers, dependency_max_blocks)
+        if dependency_probe_options is not None:
+            if self.dependency_observer is None or not dependency_probe_output_dir:
+                raise ValueError('Paired probes require dependency observation and an output directory')
+            from .sdar_dependency_probe import DependencyProbe
+            self.dependency_probe = DependencyProbe(
+                self.model, dependency_probe_output_dir, **dependency_probe_options)
+            if self.dependency_probe.layer not in self.dependency_observer.layer_ids:
+                raise ValueError('Include probe layer in dependency_layers')
         self.collect_metrics = (
             collect_metrics or collect_routing_trace
             or collect_expert_output_stats or collect_expert_token_stats)
@@ -1336,6 +1356,8 @@ class BD3withChatTemplate_original(BaseModel):
                 {key: generation_kwargs[key] for key in (
                     'gen_length', 'block_length', 'denoising_steps',
                     'temperature', 'top_k', 'top_p', 'remasking', 'mask_id')})
+            if self.dependency_probe is not None:
+                self.dependency_probe.start_sequence(self.dependency_observer.metadata)
         full_outputs = block_diffusion_generate(
             self.model,
             self.tokenizer,
@@ -1353,6 +1375,7 @@ class BD3withChatTemplate_original(BaseModel):
             stopping_criteria_idx=stopping_criteria_idx,
             metrics_collector=metrics_collector,
             dependency_observer=self.dependency_observer,
+            dependency_probe=self.dependency_probe,
             )
         if self.dependency_observer is not None:
             self.dependency_observer.finish_sequence()

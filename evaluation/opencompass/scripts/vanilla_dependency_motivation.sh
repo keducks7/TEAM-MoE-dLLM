@@ -17,6 +17,12 @@ RUN_DIR="${RUN_DIR:-$PWD/analysis/records/dependency/${DATASET}_$(date +%Y%m%d_%
 OPTIONS=()
 if [[ "${HOOK_OFF:-0}" == 1 ]]; then OPTIONS+=(--hook-off); fi
 if [[ "${DRY_RUN:-0}" == 1 ]]; then OPTIONS+=(--dry-run); fi
+if [[ "${PROBE:-0}" == 1 ]]; then
+    OPTIONS+=(--probe --probe-layer "${PROBE_LAYER:-24}" --probe-pool-size "${PROBE_POOL_SIZE:-12}"
+        --probe-stride "${PROBE_STRIDE:-2}" --probe-max-steps "${PROBE_MAX_STEPS:-48}"
+        --probe-mass-tolerance "${PROBE_MASS_TOLERANCE:-0.03}"
+        --probe-confidence-tolerance "${PROBE_CONFIDENCE_TOLERANCE:-0.05}")
+fi
 "$PYTHON_BIN" scripts/run_dependency_motivation.py \
     --dataset "$DATASET" \
     --model-path "${MODEL_PATH:-/root/lkd/Models/SDAR-30B-A3B-Chat-b32}" \
@@ -28,5 +34,11 @@ if [[ "${DRY_RUN:-0}" == 1 ]]; then OPTIONS+=(--dry-run); fi
 if [[ "${HOOK_OFF:-0}" != 1 && "${DRY_RUN:-0}" != 1 ]]; then
     "$PYTHON_BIN" analysis/tools/analyze_dependency_motivation.py \
         --trace-dir "$RUN_DIR/traces" --output-dir "$RUN_DIR/report"
+    "$PYTHON_BIN" analysis/tools/analyze_dependency_drift.py \
+        --trace-dir "$RUN_DIR/traces" --output-dir "$RUN_DIR/drift"
+    if [[ "${PROBE:-0}" == 1 ]]; then
+        "$PYTHON_BIN" analysis/tools/analyze_dependency_probes.py \
+            --probe-dir "$RUN_DIR/probes" --output-dir "$RUN_DIR/probe_report"
+    fi
 fi
 echo "Run directory: $RUN_DIR"

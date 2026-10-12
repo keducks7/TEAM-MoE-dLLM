@@ -14,6 +14,7 @@ scripts/*
 !scripts/vanilla_dependency_motivation.sh
 !scripts/test_dependency_motivation.py
 !scripts/compare_dependency_predictions.py
+!scripts/test_dependency_next_steps.py
 icl_inference_output/
 .vscode/
 tmp/

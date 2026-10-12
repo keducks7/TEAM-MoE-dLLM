@@ -21,7 +21,7 @@ def validate_gpu_count(requested, available, visible):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', choices=['humaneval', 'mbpp'], default='humaneval')
+    parser.add_argument('--dataset', choices=['humaneval', 'mbpp', 'gsm8k'], default='humaneval')
     parser.add_argument('--model-path', required=True)
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--samples', type=int, default=32)
@@ -34,9 +34,22 @@ def main():
     parser.add_argument('--memory', default='74GiB')
     parser.add_argument('--hook-off', action='store_true', help='Same settings without observation, for prediction parity checks')
     parser.add_argument('--dry-run', action='store_true', help='Write manifest and resolved config without loading weights')
+    parser.add_argument('--probe', action='store_true', help='Extra paired diagnostic forwards; original decoding remains baseline')
+    parser.add_argument('--probe-layer', type=int, default=24)
+    parser.add_argument('--probe-pool-size', type=int, default=12)
+    parser.add_argument('--probe-stride', type=int, default=2)
+    parser.add_argument('--probe-max-steps', type=int, default=48)
+    parser.add_argument('--probe-mass-tolerance', type=float, default=.03)
+    parser.add_argument('--probe-confidence-tolerance', type=float, default=.05)
     args = parser.parse_args()
     if min(args.samples, args.max_blocks, args.gen_length, args.gpus) < 1 or args.sample_start < 0:
         parser.error('Counts must be positive; sample-start must be nonnegative')
+    if args.probe and args.hook_off:
+        parser.error('--probe and --hook-off cannot be combined')
+    if min(args.probe_stride, args.probe_max_steps) < 1 or args.probe_layer < 0 or args.probe_pool_size < 8:
+        parser.error('Invalid probe layer/pool/stride/limit')
+    if min(args.probe_mass_tolerance, args.probe_confidence_tolerance) < 0:
+        parser.error('Matching tolerances must be nonnegative')
     root = Path(__file__).resolve().parents[1]
     os.chdir(root)
     sys.path.insert(0, str(root))
@@ -70,6 +83,13 @@ def main():
     model.update(collect_metrics=False, collect_dependency_trace=not args.hook_off,
                  dependency_trace_output_dir=str(args.output_dir / 'traces'),
                  dependency_layers=args.layers, dependency_max_blocks=args.max_blocks)
+    if args.probe:
+        model.update(dependency_probe_output_dir=str(args.output_dir / 'probes'),
+                     dependency_probe_options=dict(layer=args.probe_layer,
+                         pool_size=args.probe_pool_size, stride=args.probe_stride,
+                         max_steps=args.probe_max_steps,
+                         mass_tolerance=args.probe_mass_tolerance,
+                         confidence_tolerance=args.probe_confidence_tolerance))
     model['generation_kwargs']['gen_length'] = args.gen_length
     cfg.work_dir = str(args.output_dir / 'opencompass')
     cfg.infer['runner']['retry'] = 0

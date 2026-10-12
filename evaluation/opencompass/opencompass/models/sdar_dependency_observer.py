@@ -162,6 +162,7 @@ class DependencyObserver:
         self.metadata['model_source_sha256'] = hashlib.sha256(source.read_bytes()).hexdigest()
 
     def begin_step(self, block_id, step, positions, token_ids, mask):
+        self.last_record = None
         if token_ids.shape[0] != 1:
             raise ValueError('Dependency collection requires batch_size=1')
         if block_id not in self.blocks:
@@ -191,6 +192,7 @@ class DependencyObserver:
                       confidence=confidence[0].detach().float().cpu().numpy(),
                       accepted=accepted[0].detach().cpu().numpy())
         self.records.append(record)
+        self.last_record = record
         self.capture = {}
 
     def finish_sequence(self):
