@@ -110,7 +110,7 @@ def main():
         return
     # --debug executes inference in this seeded process, not a fresh worker.
     cli.get_config_from_arg = lambda _args: cfg
-    sys.argv = ['run.py', str(config_path), '--debug']
+    sys.argv = ['run.py', str(config_path), '--debug', '--mode', 'infer']
     cli.main()
 
 
