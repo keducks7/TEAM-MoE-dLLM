@@ -962,9 +962,16 @@ class BD3withChatTemplate_original(BaseModel):
         if dependency_probe_options is not None:
             if self.dependency_observer is None or not dependency_probe_output_dir:
                 raise ValueError('Paired probes require dependency observation and an output directory')
-            from .sdar_dependency_probe import DependencyProbe
-            self.dependency_probe = DependencyProbe(
-                self.model, dependency_probe_output_dir, **dependency_probe_options)
+            probe_options = dict(dependency_probe_options)
+            probe_kind = probe_options.pop('kind', 'pair')
+            if probe_kind == 'pair':
+                from .sdar_dependency_probe import DependencyProbe as Probe
+            elif probe_kind == 'frontier':
+                from .sdar_frontier_probe import FrontierProbe as Probe
+            else:
+                raise ValueError(f'Unknown dependency probe kind: {probe_kind}')
+            self.dependency_probe = Probe(
+                self.model, dependency_probe_output_dir, **probe_options)
             if self.dependency_probe.layer not in self.dependency_observer.layer_ids:
                 raise ValueError('Include probe layer in dependency_layers')
         self.collect_metrics = (

@@ -18,7 +18,7 @@ OPTIONS=()
 if [[ "${HOOK_OFF:-0}" == 1 ]]; then OPTIONS+=(--hook-off); fi
 if [[ "${DRY_RUN:-0}" == 1 ]]; then OPTIONS+=(--dry-run); fi
 if [[ "${PROBE:-0}" == 1 ]]; then
-    OPTIONS+=(--probe --probe-layer "${PROBE_LAYER:-24}" --probe-pool-size "${PROBE_POOL_SIZE:-12}"
+    OPTIONS+=(--probe --probe-kind "${PROBE_KIND:-pair}" --probe-layer "${PROBE_LAYER:-24}" --probe-pool-size "${PROBE_POOL_SIZE:-12}"
         --probe-stride "${PROBE_STRIDE:-2}" --probe-max-steps "${PROBE_MAX_STEPS:-48}"
         --probe-mass-tolerance "${PROBE_MASS_TOLERANCE:-0.03}"
         --probe-confidence-tolerance "${PROBE_CONFIDENCE_TOLERANCE:-0.05}")
@@ -37,7 +37,12 @@ if [[ "${HOOK_OFF:-0}" != 1 && "${DRY_RUN:-0}" != 1 ]]; then
     "$PYTHON_BIN" analysis/tools/analyze_dependency_drift.py \
         --trace-dir "$RUN_DIR/traces" --output-dir "$RUN_DIR/drift"
     if [[ "${PROBE:-0}" == 1 ]]; then
-        "$PYTHON_BIN" analysis/tools/analyze_dependency_probes.py \
+        if [[ "${PROBE_KIND:-pair}" == frontier ]]; then
+            PROBE_ANALYZER=analysis/tools/analyze_frontier_probes.py
+        else
+            PROBE_ANALYZER=analysis/tools/analyze_dependency_probes.py
+        fi
+        "$PYTHON_BIN" "$PROBE_ANALYZER" \
             --probe-dir "$RUN_DIR/probes" --output-dir "$RUN_DIR/probe_report"
     fi
 fi

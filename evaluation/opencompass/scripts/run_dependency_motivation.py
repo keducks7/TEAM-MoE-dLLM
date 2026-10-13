@@ -35,6 +35,7 @@ def main():
     parser.add_argument('--hook-off', action='store_true', help='Same settings without observation, for prediction parity checks')
     parser.add_argument('--dry-run', action='store_true', help='Write manifest and resolved config without loading weights')
     parser.add_argument('--probe', action='store_true', help='Extra paired diagnostic forwards; original decoding remains baseline')
+    parser.add_argument('--probe-kind', choices=['pair', 'frontier'], default='pair')
     parser.add_argument('--probe-layer', type=int, default=24)
     parser.add_argument('--probe-pool-size', type=int, default=12)
     parser.add_argument('--probe-stride', type=int, default=2)
@@ -84,12 +85,14 @@ def main():
                  dependency_trace_output_dir=str(args.output_dir / 'traces'),
                  dependency_layers=args.layers, dependency_max_blocks=args.max_blocks)
     if args.probe:
+        options = dict(kind=args.probe_kind, layer=args.probe_layer,
+                       stride=args.probe_stride, max_steps=args.probe_max_steps,
+                       mass_tolerance=args.probe_mass_tolerance,
+                       confidence_tolerance=args.probe_confidence_tolerance)
+        if args.probe_kind == 'pair':
+            options['pool_size'] = args.probe_pool_size
         model.update(dependency_probe_output_dir=str(args.output_dir / 'probes'),
-                     dependency_probe_options=dict(layer=args.probe_layer,
-                         pool_size=args.probe_pool_size, stride=args.probe_stride,
-                         max_steps=args.probe_max_steps,
-                         mass_tolerance=args.probe_mass_tolerance,
-                         confidence_tolerance=args.probe_confidence_tolerance))
+                     dependency_probe_options=options)
     model['generation_kwargs']['gen_length'] = args.gen_length
     cfg.work_dir = str(args.output_dir / 'opencompass')
     cfg.infer['runner']['retry'] = 0

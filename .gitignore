@@ -217,3 +217,4 @@ __marimo__/
 !/evaluation/opencompass/analysis/tools/analyze_dependency_motivation.py
 !/evaluation/opencompass/analysis/tools/analyze_dependency_drift.py
 !/evaluation/opencompass/analysis/tools/analyze_dependency_probes.py
+!/evaluation/opencompass/analysis/tools/analyze_frontier_probes.py
