@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -36,7 +37,8 @@ nodes = [n for n in tree.body if getattr(n, 'name', '') in
          {'_select_team_expert_pool', 'SDARMoeSparseMoeBlock'}]
 exec(compile(ast.Module(body=nodes, type_ignores=[]), str(MODEL_SOURCE), 'exec'), scope)
 names = {'_install_team_metric_hooks', '_install_team_native_metrics', '_team_cuda_devices', '_synchronize_model_cuda',
-         '_run_team_generation', '_record_team_acceptance', '_finalize_team_collector', '_team_denoising_forward',
+         '_run_team_generation', '_record_team_acceptance', '_finalize_team_collector',
+         '_team_generation_diagnostics', '_team_denoising_forward',
          'add_gumbel_noise', 'top_k_logits', 'top_p_logits', 'sample_with_temperature_topk_topp',
          'get_num_transfer_tokens', '_pack_team_positions', 'block_diffusion_generate'}
 nodes = [n for n in ast.parse(WRAPPER.read_text()).body if getattr(n, 'name', '') in names]
@@ -108,12 +110,63 @@ class RuntimeTests(unittest.TestCase):
         mass = torch.tensor([[.8, .2, 0, 0, 0], [0, 0, .6, .4, 0], [.4, 0, 0, 0, .6]])
         hot, pending = torch.tensor([False, False, True]), torch.tensor([True, True, False])
         capacities = []
-        for strategy in ['reference', 'protected']:
+        for strategy in ['reference', 'protected', 'protected_hot']:
             pool, info = scope['_select_team_expert_pool'](ids, mass, hot, pending, 2, strategy, .9)
             self.assertTrue(pool[:4].all())
             self.assertEqual(info['budget_relaxed'], 1)
             capacities.append(info['actual_budget'])
-        self.assertEqual(capacities, [5, 5])
+        self.assertEqual(capacities, [5, 5, 5])
+
+    def test_protected_hot_changes_only_remainder_voters(self):
+        ids = torch.tensor([[0, 1], [2, 3], [4, 5]])
+        mass = torch.tensor([[.9, .1, 0, 0, 0, 0], [0, 0, .95, .05, 0, 0],
+                             [0, 0, 0, 0, .99, .01]])
+        hot = torch.tensor([True, True, False])
+        pending = torch.zeros(3, dtype=torch.bool)
+        cold_pool, cold_info = scope['_select_team_expert_pool'](ids, mass, hot, pending, 3, 'protected', .9)
+        hot_pool, hot_info = scope['_select_team_expert_pool'](ids, mass, hot, pending, 3, 'protected_hot', .9)
+        self.assertEqual(cold_info, hot_info)
+        self.assertEqual(hot_info['protected_prefix_size'], 2)
+        self.assertEqual(hot_info['remaining_after_protection'], 1)
+        self.assertEqual(torch.where(cold_pool)[0].tolist(), [0, 2, 4])
+        self.assertEqual(torch.where(hot_pool)[0].tolist(), [0, 1, 2])
+        for budget in (2,):
+            a, _ = scope['_select_team_expert_pool'](ids, mass, hot, pending, budget, 'protected', .9)
+            b, info = scope['_select_team_expert_pool'](ids, mass, hot, pending, budget, 'protected_hot', .9)
+            self.assertEqual(info['remaining_after_protection'], 0)
+            self.assertTrue(torch.equal(a, b))
+
+    def test_protected_hot_without_hot_uses_existing_fallback(self):
+        ids = torch.tensor([[0, 1], [2, 3]])
+        mass = torch.tensor([[.9, .1, 0, 0], [0, 0, .8, .2]])
+        hot = pending = torch.zeros(2, dtype=torch.bool)
+        a, ai = scope['_select_team_expert_pool'](ids, mass, hot, pending, 3, 'protected', .9)
+        b, bi = scope['_select_team_expert_pool'](ids, mass, hot, pending, 3, 'protected_hot', .9)
+        self.assertTrue(torch.equal(a, b))
+        self.assertEqual(ai, bi)
+
+    def test_old_selection_strategies_match_committed_source(self):
+        try:
+            source = subprocess.check_output(['git', 'show', '10bf5a0:modeling_sdar_moe.py'],
+                                             cwd=MODEL_SOURCE.parent, text=True, stderr=subprocess.PIPE)
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            self.skipTest('Historical source unavailable (e.g. a shallow checkout)')
+        nodes = [n for n in ast.parse(source).body if getattr(n, 'name', '') == '_select_team_expert_pool']
+        previous = dict(torch=torch)
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), '<committed-selector>', 'exec'), previous)
+        for seed in range(8):
+            torch.manual_seed(seed)
+            logits = torch.randn(20, 32)
+            values, ids = torch.topk(logits.softmax(-1), 8, dim=-1)
+            mass = torch.zeros_like(logits).scatter_(1, ids, values / values.sum(-1, keepdim=True))
+            hot = torch.arange(20) % 3 == 0
+            pending = torch.arange(20) % 3 == 1
+            for strategy in ('reference', 'protected'):
+                for budget in (8, 16, 36):
+                    a, ai = previous['_select_team_expert_pool'](ids, mass, hot, pending, budget, strategy, .9)
+                    b, bi = scope['_select_team_expert_pool'](ids, mass, hot, pending, budget, strategy, .9)
+                    self.assertTrue(torch.equal(a, b))
+                    self.assertEqual(ai, bi)
 
     def test_reference_at_large_capacity_reproduces_original_lac(self):
         moe = new_moe()
@@ -172,12 +225,44 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(timer_only['accepted_tokens'], 32)
         self.assertEqual(timer_only['layer_forwards'], 0)
 
+    def test_protected_hot_real_generation_native_and_hook_counts_match(self):
+        model = ToyModel().eval()
+        scope['_install_team_native_metrics'](model)
+        scope['_install_team_metric_hooks'](model)
+        prompt = dict(input_ids=torch.full((1, 32), 2), attention_mask=torch.ones(1, 32))
+        args = dict(tokenizer=None, prompt=prompt, mask_id=151669, gen_length=32,
+            block_length=32, denoising_steps=32, temperature=1., top_k=1, top_p=1.,
+            threshold=.95, stopping_criteria_idx=[], team_pool_strategy='protected_hot', team_pool_budget=8)
+        a_counts, b_counts = collector(), collector('hook')
+        torch.manual_seed(12)
+        a = scope['block_diffusion_generate'](model=model, metrics_collector=a_counts, **args)
+        torch.manual_seed(12)
+        b = scope['block_diffusion_generate'](model=model, metrics_collector=b_counts, **args)
+        self.assertTrue(torch.equal(a, b))
+        self.assertEqual(a_counts['accepted_tokens'], 32)
+        for key in ('activated_experts', 'layer_forwards', 'denoising_forwards',
+                    'pool_remainder_layer_forwards', 'pool_remainder_slots_sum'):
+            self.assertEqual(a_counts.get(key, 0), b_counts.get(key, 0))
+
     def test_seh_transition_count_includes_verified_prefill(self):
         c = collector()
         scope['_record_team_acceptance'](c, torch.tensor([[True, True, False]]),
             torch.tensor([[7, 8, 9]]), torch.tensor([[False, True, False]]), 151669)
         self.assertEqual(c['accepted_tokens'], 2)
         self.assertEqual(c['transfer_accepted_tokens'], 1)
+
+    def test_generation_diagnostics_do_not_change_tokens_or_rng(self):
+        state = torch.random.get_rng_state().clone()
+        for tokens, stops, expected in [([7, 8, 151669], [8], 'stop_token'),
+                                       ([7, 8], [], 'length_limit'),
+                                       ([7, 151669], [], 'incomplete'),
+                                       ([7, 8], [8], 'stop_token')]:
+            x = torch.tensor([tokens]); before = x.clone()
+            result = scope['_team_generation_diagnostics'](x, stops, 151669)
+            self.assertEqual(result['generation_stop_reason'], expected)
+            self.assertEqual(result['generation_capacity_tokens'], len(tokens))
+            self.assertTrue(torch.equal(x, before))
+        self.assertTrue(torch.equal(state, torch.random.get_rng_state()))
 
     def test_timer_seed_restoration_and_sample_order_independence(self):
         saved = scope['block_diffusion_generate']
@@ -210,12 +295,15 @@ class RuntimeTests(unittest.TestCase):
             model = dict(abbr='toy', path='toy', run_cfg={}, model_kwargs={}, generation_kwargs={})
             cfg = dict(models=[model], datasets=[dict(reader_cfg={}, infer_cfg=dict(inferencer={}))],
                 infer=dict(runner={}), eval=dict(partitioner={}))
-            with patch.dict(os.environ, {'MODE': 'metrics', 'TEAM_POOL_STRATEGY': 'protected'}):
+            with patch.dict(os.environ, {'MODE': 'metrics', 'TEAM_POOL_STRATEGY': 'protected_hot',
+                                        'SEED': '42', 'SAMPLES': 'all'}):
                 exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), cfg)
             self.assertTrue(model['collect_metrics'])
             self.assertEqual(model['metrics_backend'], 'native')
             self.assertEqual(model['accepted_token_mode'], 'mask_transitions')
             self.assertEqual(model['generation_kwargs']['cold_expert_budget'], 0)
+            self.assertEqual(model['generation_kwargs']['team_pool_strategy'], 'protected_hot')
+            self.assertNotIn('test_range', cfg['datasets'][0]['reader_cfg'])
 
 
 def load_file(name, path):
@@ -247,6 +335,19 @@ class AggregationTests(unittest.TestCase):
             self.assertEqual(totals.layer_forwards, 0)
             self.assertEqual(totals.tpf, 3)
 
+    def test_optional_stop_and_remainder_counts(self):
+        tool = load_file('team_metric_tool_diagnostics', ROOT / 'analysis/tools/calculate_team_metrics.py')
+        with tempfile.TemporaryDirectory() as tmp:
+            row = dict(schema='sdar_metrics_v1', activated_experts=0, layer_forwards=0,
+                accepted_tokens=6, denoising_forwards=2, metrics_collected=False,
+                generation_stop_reason='length_limit', pool_layer_forwards=10,
+                pool_remainder_layer_forwards=3, pool_remainder_slots_sum=7)
+            (Path(tmp) / 'team_metrics_pid1.jsonl').write_text(json.dumps(row) + '\n')
+            totals, _, _, _ = tool.calculate_compact_metrics(Path(tmp), '*_metrics_*.jsonl')
+            self.assertEqual(totals.stop_reason_counts, {'length_limit': 1})
+            self.assertEqual(totals.pool_remainder_layer_forwards, 3)
+            self.assertEqual(totals.pool_remainder_slots_sum, 7)
+
     def test_latency_comparison_rejects_different_instrumentation(self):
         tool = load_file('team_time_compare', ROOT / 'analysis/tools/compare_team_latency.py')
         a = {'prompt': dict(generation_latency_s=4, metrics_collected=False)}
@@ -255,6 +356,29 @@ class AggregationTests(unittest.TestCase):
         b['prompt']['metrics_collected'] = True
         with self.assertRaisesRegex(ValueError, 'metrics_collected'):
             tool.compare(a, b)
+
+
+class LauncherTests(unittest.TestCase):
+    def test_summary_is_appended_and_failure_is_propagated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake = root / 'fake_python'
+            fake.write_text('#!/usr/bin/env bash\n'
+                'if [[ "$1" == -u ]]; then echo mock-run-output; exit 0; fi\n'
+                'echo mock-metric-output\necho mock-metric-stderr >&2\n'
+                'exit "${FAKE_METRIC_EXIT:-0}"\n')
+            fake.chmod(0o755)
+            for code in (0, 7):
+                output = root / f'runs{code}'
+                env = dict(os.environ, PYTHON_BIN=str(fake), RUN_ROOT=str(output),
+                    DATASET='humaneval', METHOD='protected_hot', MODE='acc',
+                    COLLECT_LATENCY='1', FAKE_METRIC_EXIT=str(code))
+                result = subprocess.run(['bash', str(ROOT / 'scripts/team_frontier_pool.sh')],
+                    env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                log = next(output.glob('*/console.log')).read_text()
+                for marker in ('mock-run-output', 'mock-metric-output', 'mock-metric-stderr'):
+                    self.assertIn(marker, log)
 
 
 if __name__ == '__main__':

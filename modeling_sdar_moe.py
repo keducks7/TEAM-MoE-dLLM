@@ -269,11 +269,14 @@ def _select_team_expert_pool(selected_experts, mass, hot_rows,
                              pending_rows, budget, strategy, coverage_target):
     """One pool across all live SEH branches; pending DCD routes stay intact.
 
-    Both strategies use the same feasibility rule: reserve pending rows' full
-    top-k plus Hot top-1 when determining capacity. Reference only enforces the
-    former; protected enforces both. No metric hooks or expert-output replay.
+    All strategies use the same feasibility rule: reserve live non-mask rows'
+    full top-k plus Hot top-1 when determining capacity. The former includes
+    delayed DCD updates AND new SEH prefills, not cached prefix blocks.
+    Reference only enforces the former; protected variants enforce both.
+    protected_hot changes only the remainder voters, from Cold to Hot.
+    No metric hooks or expert-output replay.
     """
-    if strategy not in {'reference', 'protected'}:
+    if strategy not in {'reference', 'protected', 'protected_hot'}:
         raise ValueError(f'Unknown TEAM pool strategy: {strategy}')
     k = selected_experts.shape[1]
     if int(budget) < k or not 0 < float(coverage_target) <= 1:
@@ -297,7 +300,7 @@ def _select_team_expert_pool(selected_experts, mass, hot_rows,
     frequency = torch.bincount(selected_experts.flatten(), minlength=num_experts)
     hot_indices = torch.where(hot_rows)[0]
     prefix_count = pending_experts.numel()
-    if strategy == 'protected':
+    if strategy in {'protected', 'protected_hot'}:
         pool[protected_experts] = True
         prefix_count = protected_experts.numel()
         if hot_indices.numel():
@@ -312,8 +315,11 @@ def _select_team_expert_pool(selected_experts, mass, hot_rows,
                 needs_update = covered[worst] < float(coverage_target) - 1e-7
                 pool[expert] = pool[expert] | needs_update
         prefix_count = int(pool.sum().item())
-        voters = ~hot_rows & ~pending_rows
-        score = mass[voters].sum(0) if voters.any() else mass[~pending_rows].sum(0)
+        if strategy == 'protected_hot':
+            score = mass[hot_rows].sum(0) if hot_indices.numel() else mass[~pending_rows].sum(0)
+        else:
+            voters = ~hot_rows & ~pending_rows
+            score = mass[voters].sum(0) if voters.any() else mass[~pending_rows].sum(0)
     else:
         score = mass[hot_rows].sum(0) if hot_indices.numel() else mass[~pending_rows].sum(0)
     remaining = actual - prefix_count

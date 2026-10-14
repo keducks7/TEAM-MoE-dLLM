@@ -6,14 +6,14 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export MODEL_GPUS="${MODEL_GPUS:-2}"
 export DATASET="${DATASET:-humaneval}"
 export MODE="${MODE:-acc}"
-export SEED="${SEED:-20261014}"
+export SEED="${SEED:-42}"
 export PYTHONHASHSEED="$SEED"
-export SAMPLES="${SAMPLES:-64}" SAMPLE_START="${SAMPLE_START:-32}"
+export SAMPLES="${SAMPLES:-all}" SAMPLE_START="${SAMPLE_START:-32}"
 METHOD="${METHOD:-protected}"
 case "$METHOD" in
     team|b0|none) export TEAM_POOL_STRATEGY=none ;;
-    reference|protected) export TEAM_POOL_STRATEGY="$METHOD" ;;
-    *) echo 'METHOD must be team, reference or protected' >&2; exit 2 ;;
+    reference|protected|protected_hot) export TEAM_POOL_STRATEGY="$METHOD" ;;
+    *) echo 'METHOD must be team, reference, protected or protected_hot' >&2; exit 2 ;;
 esac
 case "$DATASET" in humaneval|mbpp|gsm8k|math) ;; *) echo 'Invalid DATASET' >&2; exit 2;; esac
 case "$MODE" in acc|metrics) ;; *) echo 'MODE must be acc or metrics' >&2; exit 2;; esac
@@ -28,5 +28,6 @@ echo "Run directory: $TASK_RUN_DIR"
     --config "configs/sdar/team/frontier_pool/eval_sdar_hf_${DATASET}_frontier_pool.py" \
     --manifest "$TASK_RUN_DIR/manifest.json" 2>&1 | tee "$TASK_RUN_DIR/console.log"
 if [[ "${COLLECT_LATENCY:-1}" == 1 || "$MODE" == metrics ]]; then
-    "$PYTHON_BIN" analysis/tools/calculate_team_metrics.py --metrics-dir "$TEAM_RECORD_DIR"
+    "$PYTHON_BIN" analysis/tools/calculate_team_metrics.py --metrics-dir "$TEAM_RECORD_DIR" \
+        2>&1 | tee -a "$TASK_RUN_DIR/console.log"
 fi

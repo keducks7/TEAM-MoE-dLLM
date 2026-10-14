@@ -8,10 +8,10 @@ POOL_STRATEGY = __import__('os').environ.get('TEAM_POOL_STRATEGY', 'protected')
 POOL_BUDGET = int(__import__('os').environ.get('TEAM_POOL_BUDGET', '36'))
 COVERAGE_TARGET = float(__import__('os').environ.get('TEAM_POOL_COVERAGE_TARGET', '0.9'))
 MODE = __import__('os').environ.get('MODE', 'acc')
-SEED = int(__import__('os').environ.get('SEED', '20261014'))
+SEED = int(__import__('os').environ.get('SEED', '42'))
 MODEL_GPUS = int(__import__('os').environ.get('MODEL_GPUS', '2'))
 GPU_MEMORY = __import__('os').environ.get('GPU_MEMORY', '37GiB' if MODEL_GPUS == 2 else '74GiB')
-SAMPLES = __import__('os').environ.get('SAMPLES', '64')
+SAMPLES = __import__('os').environ.get('SAMPLES', 'all')
 SAMPLE_START = int(__import__('os').environ.get('SAMPLE_START', '32'))
 COLLECT_LATENCY = __import__('os').environ.get('COLLECT_LATENCY', '1') == '1'
 RUN_TAG = f'humaneval_{POOL_STRATEGY}_b{POOL_BUDGET}_seed{SEED}_{MODE}'

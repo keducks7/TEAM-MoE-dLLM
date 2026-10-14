@@ -37,6 +37,11 @@ class MetricTotals:
     transfer_accepted_tokens: int = 0
     generation_latencies_s: list[float] = field(default_factory=list)
     timed_accepted_tokens: int = 0
+    pool_layer_forwards: int = 0
+    pool_remainder_layer_forwards: int = 0
+    pool_remainder_slots_sum: int = 0
+    pool_remainder_records: int = 0
+    stop_reason_counts: dict[str, int] = field(default_factory=dict)
 
     @property
     def apf(self) -> float:
@@ -353,6 +358,20 @@ def calculate_compact_metrics(
                     totals.accepted_tokens += int(record['accepted_tokens'])
                     totals.decoded_forwards += int(record['denoising_forwards'])
                     totals.expert_forwards += int(record['denoising_forwards'])
+                    for name in ('pool_layer_forwards', 'pool_remainder_layer_forwards',
+                                 'pool_remainder_slots_sum'):
+                        value = record.get(name, 0)
+                        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                            raise ValueError(f'Invalid {name} at {path}:{line_number}')
+                        setattr(totals, name, getattr(totals, name) + value)
+                    totals.pool_remainder_records += int('pool_remainder_layer_forwards' in record)
+                    if record.get('pool_remainder_layer_forwards', 0) > record.get('pool_layer_forwards', 0):
+                        raise ValueError(f'Remainder layer count exceeds pool layers at {path}:{line_number}')
+                    reason = record.get('generation_stop_reason')
+                    if reason is not None:
+                        if reason not in {'stop_token', 'length_limit', 'incomplete'}:
+                            raise ValueError(f'Invalid generation_stop_reason at {path}:{line_number}')
+                        totals.stop_reason_counts[reason] = totals.stop_reason_counts.get(reason, 0) + 1
                     latency = record.get('generation_latency_s')
                     if latency is not None:
                         latency = float(latency)
@@ -451,6 +470,12 @@ def main() -> int:
         if metric_files is not None:
             result['metric_files'] = metric_files
             result['metric_records'] = metric_records
+            if totals.stop_reason_counts:
+                result['generation_stop_reason_counts'] = totals.stop_reason_counts
+            if totals.pool_remainder_records and totals.pool_layer_forwards:
+                result.update(pool_remainder_layer_forwards=totals.pool_remainder_layer_forwards,
+                    pool_remainder_layer_fraction=totals.pool_remainder_layer_forwards / totals.pool_layer_forwards,
+                    pool_mean_remainder_slots=totals.pool_remainder_slots_sum / totals.pool_layer_forwards)
             times = totals.generation_latencies_s
             if times:
                 result.update(generation_latency_s=sum(times),
@@ -494,6 +519,12 @@ def main() -> int:
         print(f"Expert forwards   : {totals.expert_forwards}")
         print(f"Decoded forwards  : {totals.decoded_forwards}")
         print(f"Accepted tokens   : {totals.accepted_tokens}")
+        if result.get('generation_stop_reason_counts'):
+            print('Generation stops  : ' + json.dumps(result['generation_stop_reason_counts'], sort_keys=True))
+        if 'pool_remainder_layer_forwards' in result:
+            print(f"Pool remainder layers: {result['pool_remainder_layer_forwards']} "
+                  f"({result['pool_remainder_layer_fraction']:.2%})")
+            print(f"Mean remainder slots : {result['pool_mean_remainder_slots']:.4f}")
         if metric_files is None:
             print(f"Accepted mode     : {args.accepted_token_mode}")
             print(f"Transfer tokens   : {totals.transfer_accepted_tokens}")

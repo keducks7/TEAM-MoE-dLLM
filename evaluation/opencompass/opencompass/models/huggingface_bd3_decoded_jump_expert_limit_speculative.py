@@ -149,6 +149,23 @@ def _finalize_team_collector(collector, generated_tokens, mask_id):
         collector['transfer_accepted_tokens'] = None
 
 
+def _team_generation_diagnostics(generated_tokens, stopping_criteria_idx, mask_id):
+    """Observe raw generation AFTER timing; never alter stopping or output."""
+    capacity = generated_tokens.shape[1]
+    nonmask_tokens = int((generated_tokens != mask_id).sum().item())
+    has_stop = False
+    if stopping_criteria_idx:
+        stop_ids = generated_tokens.new_tensor(stopping_criteria_idx)
+        has_stop = bool(torch.isin(generated_tokens, stop_ids).any().item())
+    filled = nonmask_tokens == generated_tokens.numel()
+    reason = 'stop_token' if has_stop else ('length_limit' if filled else 'incomplete')
+    return dict(generation_capacity_tokens=capacity,
+                generated_nonmask_tokens=nonmask_tokens,
+                generation_capacity_filled=filled,
+                generation_contains_stop_token=has_stop,
+                generation_stop_reason=reason)
+
+
 def _team_denoising_forward(model, metrics_collector, **model_inputs):
     """Run one measured TEAM denoising forward and update APF totals."""
     if metrics_collector is None:
@@ -190,6 +207,10 @@ def _team_denoising_forward(model, metrics_collector, **model_inputs):
             metrics_collector['pool_actual_budget_sum'] += info['actual_budget']
             metrics_collector['pool_budget_relaxations'] += info['budget_relaxed']
             metrics_collector['pool_pending_expert_sum'] += info['pending_experts']
+            metrics_collector['pool_remainder_layer_forwards'] = metrics_collector.get(
+                'pool_remainder_layer_forwards', 0) + int(info['remaining_after_protection'] > 0)
+            metrics_collector['pool_remainder_slots_sum'] = metrics_collector.get(
+                'pool_remainder_slots_sum', 0) + info['remaining_after_protection']
     metrics_collector['denoising_forwards'] += 1
     return outputs
 
@@ -1309,8 +1330,8 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
         team_pool_strategy = generation_kwargs.get('team_pool_strategy', 'none')
         team_pool_budget = generation_kwargs.get('team_pool_budget', 36)
         team_pool_coverage_target = generation_kwargs.get('team_pool_coverage_target', .9)
-        if team_pool_strategy not in {'none', 'reference', 'protected'}:
-            raise ValueError('team_pool_strategy must be none, reference or protected')
+        if team_pool_strategy not in {'none', 'reference', 'protected', 'protected_hot'}:
+            raise ValueError('team_pool_strategy must be none, reference, protected or protected_hot')
         if (type(team_pool_budget) is not int or team_pool_budget < 8
                 or not 0 < team_pool_coverage_target <= 1):
             raise ValueError('TEAM pool budget must be >=8; coverage target in (0,1]')
@@ -1380,6 +1401,8 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
                 'pool_actual_budget_sum': 0,
                 'pool_budget_relaxations': 0,
                 'pool_pending_expert_sum': 0,
+                'pool_remainder_layer_forwards': 0,
+                'pool_remainder_slots_sum': 0,
             }
 
         prompt_sha256 = (hashlib.sha256(tokens['input_ids'].detach().cpu().numpy().tobytes()).hexdigest()
@@ -1460,6 +1483,7 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
                 'latency_includes_metric_collection': self.collect_metrics,
                 'pool_mean_actual_budget': metrics_collector['pool_actual_budget_sum'] / metrics_collector['pool_layer_forwards']
                     if metrics_collector['pool_layer_forwards'] else None,
+                **_team_generation_diagnostics(outputs, stopping_criteria_idx, generation_kwargs['mask_id']),
             }
             self._metrics_totals['sequences'] += 1
             for name in (

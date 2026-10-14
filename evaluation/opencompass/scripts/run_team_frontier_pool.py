@@ -21,7 +21,7 @@ def main():
     import torch
     from mmengine.config import Config
     from opencompass.cli import main as cli
-    seed = int(os.environ.get('SEED', '20261014'))
+    seed = int(os.environ.get('SEED', '42'))
     random.seed(seed); np.random.seed(seed % 2**32); torch.manual_seed(seed)
     cfg = Config.fromfile(args.config, format_python_code=False)
     model = cfg.models[0]
@@ -43,7 +43,7 @@ def main():
         metrics_backend=model['metrics_backend'], accepted_token_mode=model['accepted_token_mode'],
         cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'), gpus=requested,
         torch_version=torch.__version__, model_source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
-        sample_start=os.environ.get('SAMPLE_START', '32'), samples=os.environ.get('SAMPLES', '64'),
+        sample_start=os.environ.get('SAMPLE_START', '32'), samples=os.environ.get('SAMPLES', 'all'),
         records_dir=model['metrics_output_dir'], work_dir=cfg.work_dir,
         timing_scope='generation only: prefill + denoising + cache commit; model loading/evaluation excluded')
     args.manifest.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
