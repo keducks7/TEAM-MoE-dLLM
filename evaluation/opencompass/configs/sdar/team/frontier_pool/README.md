@@ -97,7 +97,7 @@ cp -n /root/lkd/Models/SDAR-30B-A3B-Chat-b32/modeling_sdar_moe.py \
       /root/lkd/Models/SDAR-30B-A3B-Chat-b32/modeling_sdar_moe.before_frontier.py
 cp modeling_sdar_moe.py /root/lkd/Models/SDAR-30B-A3B-Chat-b32/modeling_sdar_moe.py
 cd evaluation/opencompass
-export PYTHON_BIN=/root/miniconda3/envs/team/bin/python
+export PYTHON_BIN=/root/anaconda3/envs/team/bin/python
 export MODEL_PATH=/root/lkd/Models/SDAR-30B-A3B-Chat-b32
 export CUDA_VISIBLE_DEVICES=0,1 MODEL_GPUS=2 GPU_MEMORY=37GiB
 export SEED=42
