@@ -265,6 +265,71 @@ class SDARMoeMLP(nn.Module):
             return down_proj
 
 
+def _select_team_expert_pool(selected_experts, mass, hot_rows,
+                             pending_rows, budget, strategy, coverage_target):
+    """One pool across all live SEH branches; pending DCD routes stay intact.
+
+    Both strategies use the same feasibility rule: reserve pending rows' full
+    top-k plus Hot top-1 when determining capacity. Reference only enforces the
+    former; protected enforces both. No metric hooks or expert-output replay.
+    """
+    if strategy not in {'reference', 'protected'}:
+        raise ValueError(f'Unknown TEAM pool strategy: {strategy}')
+    k = selected_experts.shape[1]
+    if int(budget) < k or not 0 < float(coverage_target) <= 1:
+        raise ValueError('Pool budget must be >= top-k; coverage target in (0,1]')
+    # Dense original-top-k mass, with zeros outside original routes.
+    num_experts = mass.shape[1]
+    candidates = torch.unique(selected_experts)
+    active = torch.zeros(num_experts, dtype=torch.bool, device=mass.device)
+    active[candidates] = True
+    pending_experts = torch.unique(selected_experts[pending_rows])
+    hot_top1 = torch.unique(selected_experts[hot_rows, 0])
+    reference_experts = torch.unique(selected_experts[hot_rows | pending_rows])
+    protected_experts = torch.unique(torch.cat((pending_experts, hot_top1)))
+    # A capacity is an upper bound, not a requirement to activate extra Cold
+    # experts in layers where original TEAM already uses a smaller pool.
+    reference_capacity = max(k, reference_experts.numel())
+    capped = min(int(budget), candidates.numel(), reference_capacity)
+    actual = max(capped, protected_experts.numel())
+    pool = torch.zeros_like(active)
+    pool[pending_experts] = True
+    frequency = torch.bincount(selected_experts.flatten(), minlength=num_experts)
+    hot_indices = torch.where(hot_rows)[0]
+    prefix_count = pending_experts.numel()
+    if strategy == 'protected':
+        pool[protected_experts] = True
+        prefix_count = protected_experts.numel()
+        if hot_indices.numel():
+            hot_mass = mass[hot_indices]
+            # Fixed GPU iterations avoid a host .item() synchronization for
+            # every greedy addition. Once target is met, iterations are no-ops.
+            for _ in range(actual - prefix_count):
+                covered = hot_mass @ pool.to(mass.dtype)
+                worst = covered.argmin()
+                missing_score = hot_mass[worst].masked_fill(pool, -torch.inf)
+                expert = missing_score.argmax()
+                needs_update = covered[worst] < float(coverage_target) - 1e-7
+                pool[expert] = pool[expert] | needs_update
+        prefix_count = int(pool.sum().item())
+        voters = ~hot_rows & ~pending_rows
+        score = mass[voters].sum(0) if voters.any() else mass[~pending_rows].sum(0)
+    else:
+        score = mass[hot_rows].sum(0) if hot_indices.numel() else mass[~pending_rows].sum(0)
+    remaining = actual - prefix_count
+    if remaining:
+        available = torch.where(active & ~pool)[0]
+        # Stable ties: frequency, then expert ID (available is sorted).
+        available = available[torch.argsort(frequency[available], descending=True, stable=True)]
+        available = available[torch.argsort(score[available], descending=True, stable=True)]
+        pool[available[:remaining]] = True
+    return pool, dict(requested_budget=int(budget), actual_budget=actual,
+        original_union=candidates.numel(), pending_experts=pending_experts.numel(),
+        team_reference_union=reference_experts.numel(),
+        protected_experts=protected_experts.numel(), budget_relaxed=int(actual > capped),
+        protected_prefix_size=prefix_count, remaining_after_protection=remaining)
+
+
 class SDARMoeSparseMoeBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -285,7 +350,10 @@ class SDARMoeSparseMoeBlock(nn.Module):
                 cold_expert_budget: int = 0,
                 cold_expert_selection: str = "probability_sum",
                 cold_reuse_mask=None, cold_zero_mask=None, hot_mask=None,
-                hot_prune_count: int = 0, hot_protect_top1: bool = True) -> torch.Tensor:
+                hot_prune_count: int = 0, hot_protect_top1: bool = True,
+                team_pool_strategy: str = 'none', team_pool_budget: int = 36,
+                team_pool_coverage_target: float = .9, team_mask_index=None,
+                team_collect_expert_stats: bool = False) -> torch.Tensor:
         # """ """
         # batch_size, sequence_length, hidden_dim = hidden_states.shape
         # hidden_states = hidden_states.view(-1, hidden_dim)
@@ -331,6 +399,9 @@ class SDARMoeSparseMoeBlock(nn.Module):
         # """ """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         original_shape = hidden_states.shape
+        self._team_last_pool_info = None
+        if team_collect_expert_stats:
+            self._team_last_active_experts = 0
         
         # 如果没有past_hidden_states，执行正常逻辑
         if past_hidden_states is None:
@@ -341,6 +412,8 @@ class SDARMoeSparseMoeBlock(nn.Module):
             routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
             routing_weights, selected_experts = torch.topk(
                 routing_weights, self.top_k, dim=-1)
+            if team_collect_expert_stats:
+                self._team_last_active_experts = torch.unique(selected_experts).numel()
             if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
                 routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
             # we cast back to the input dtype
@@ -426,7 +499,7 @@ class SDARMoeSparseMoeBlock(nn.Module):
                 compute_expert_limit_mask = expert_limit_index_flat[compute_mask_flat]
                 
                 # 如果有expert_limit位置，需要进行专家限制处理
-                if compute_expert_limit_mask.any():
+                if team_pool_strategy == 'none' and compute_expert_limit_mask.any():
                     # 获取需要限制的token索引
                     limited_token_indices = torch.where(compute_expert_limit_mask)[0]
                     
@@ -548,7 +621,7 @@ class SDARMoeSparseMoeBlock(nn.Module):
                 
                 # Build the cold pool BEFORE pruning hot routes, so this
                 # intervention cannot silently change cold's candidate set.
-                if hot_prune_count > 0 and hot_mask is not None:
+                if team_pool_strategy == 'none' and hot_prune_count > 0 and hot_mask is not None:
                     hot_rows = hot_mask.reshape(-1)[compute_mask_flat]
                     hot_ids = torch.where(hot_rows)[0]
                     if hot_ids.numel() > 0:
@@ -571,6 +644,31 @@ class SDARMoeSparseMoeBlock(nn.Module):
                             weights, ids = torch.topk(scores, self.top_k, dim=-1)
                             compute_selected_experts[hot_ids] = ids
                             compute_routing_weights_topk[hot_ids] = weights
+
+                if team_pool_strategy != 'none':
+                    if team_mask_index is None or hot_mask is None:
+                        raise ValueError('TEAM pool requires explicit mask and Hot positions')
+                    masked_rows = team_mask_index.reshape(-1)[compute_mask_flat]
+                    hot_rows = hot_mask.reshape(-1)[compute_mask_flat] & masked_rows
+                    pending_rows = ~masked_rows
+                    original_mass = torch.zeros_like(compute_routing_weights)
+                    original_weights = compute_routing_weights_topk / compute_routing_weights_topk.sum(-1, keepdim=True)
+                    original_mass.scatter_(1, compute_selected_experts, original_weights)
+                    pool, self._team_last_pool_info = _select_team_expert_pool(
+                        compute_selected_experts, original_mass, hot_rows, pending_rows,
+                        team_pool_budget, team_pool_strategy, team_pool_coverage_target)
+                    # Do not recompute unchanged routes (including pending DCD
+                    # rows): preserve their expert order and arithmetic exactly.
+                    changed = masked_rows & ~pool[compute_selected_experts].all(-1)
+                    changed_indices = torch.where(changed)[0]
+                    if changed_indices.numel():
+                        scores = compute_routing_weights[changed_indices].masked_fill(
+                            ~pool.unsqueeze(0), -torch.inf)
+                        weights, ids = torch.topk(scores, self.top_k, dim=-1)
+                        compute_selected_experts[changed_indices] = ids
+                        compute_routing_weights_topk[changed_indices] = weights
+                if team_collect_expert_stats:
+                    self._team_last_active_experts = torch.unique(compute_selected_experts).numel()
 
                 # 应用标准化（如果需要）
                 if self.norm_topk_prob:
@@ -750,9 +848,14 @@ class SDARMoeDecoderLayer(nn.Module):
                 cold_zero_mask=kwargs.get('cold_zero_mask'),
                 hot_mask=kwargs.get('hot_mask'),
                 hot_prune_count=kwargs.get('hot_prune_count', 0),
-                hot_protect_top1=kwargs.get('hot_protect_top1', True))
+                hot_protect_top1=kwargs.get('hot_protect_top1', True),
+                team_pool_strategy=kwargs.get('team_pool_strategy', 'none'),
+                team_pool_budget=kwargs.get('team_pool_budget', 36),
+                team_pool_coverage_target=kwargs.get('team_pool_coverage_target', .9),
+                team_mask_index=kwargs.get('team_mask_index'),
+                team_collect_expert_stats=kwargs.get('team_collect_expert_stats', False))
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(hidden_states, team_collect_expert_stats=kwargs.get('team_collect_expert_stats', False))
         
         if isinstance(hidden_states, tuple):
             hidden_states, router_logits = hidden_states

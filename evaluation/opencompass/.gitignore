@@ -17,6 +17,13 @@ scripts/*
 !scripts/test_dependency_next_steps.py
 !scripts/test_frontier_probe.py
 !scripts/vanilla_frontier_probe.sh
+!scripts/decoding_expert_structure.sh
+!scripts/test_decoding_expert_structure.py
+!scripts/frontier_expert_pools.sh
+!scripts/test_frontier_expert_pools.py
+!scripts/team_frontier_pool.sh
+!scripts/run_team_frontier_pool.py
+!scripts/test_team_frontier_runtime.py
 icl_inference_output/
 .vscode/
 tmp/

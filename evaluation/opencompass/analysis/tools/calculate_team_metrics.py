@@ -20,7 +20,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import math
+import statistics
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -33,6 +35,8 @@ class MetricTotals:
     accepted_tokens: int = 0
     decoded_forwards: int = 0
     transfer_accepted_tokens: int = 0
+    generation_latencies_s: list[float] = field(default_factory=list)
+    timed_accepted_tokens: int = 0
 
     @property
     def apf(self) -> float:
@@ -322,6 +326,7 @@ def calculate_compact_metrics(
     totals = MetricTotals()
     records = 0
     warnings: list[str] = []
+    signatures = set()
     for path in files:
         try:
             with path.open('r', encoding='utf-8') as file:
@@ -333,11 +338,28 @@ def calculate_compact_metrics(
                             'sdar_vanilla_metrics_v1', 'sdar_metrics_v1'}:
                         raise ValueError(
                             f'Unknown metric schema in {path}:{line_number}')
+                    signatures.add((record.get('metrics_collected', True),
+                        record.get('accepted_token_mode', 'legacy_unspecified'),
+                        record.get('team_pool_strategy', 'legacy_unspecified'),
+                        record.get('team_pool_budget'), record.get('team_pool_coverage_target'),
+                        record.get('metrics_backend', 'legacy_unspecified'),
+                        record.get('latency_scope', 'legacy_unspecified'),
+                        record.get('model_source_sha256'), record.get('seed_base'),
+                        json.dumps(record.get('generation_settings', {}), sort_keys=True)))
+                    if len(signatures) > 1:
+                        raise ValueError('Mixed strategy/counting/backend/timing settings; aggregate each run separately')
                     totals.activated_experts += int(record['activated_experts'])
                     totals.layer_forwards += int(record['layer_forwards'])
                     totals.accepted_tokens += int(record['accepted_tokens'])
                     totals.decoded_forwards += int(record['denoising_forwards'])
                     totals.expert_forwards += int(record['denoising_forwards'])
+                    latency = record.get('generation_latency_s')
+                    if latency is not None:
+                        latency = float(latency)
+                        if not math.isfinite(latency) or latency <= 0:
+                            raise ValueError(f'Invalid generation latency at {path}:{line_number}')
+                        totals.generation_latencies_s.append(latency)
+                        totals.timed_accepted_tokens += int(record['accepted_tokens'])
                     records += 1
         except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
             raise ValueError(f'Cannot read {path}: {error}') from error
@@ -416,9 +438,9 @@ def main() -> int:
             metric_files = None
             metric_records = None
         result = {
-            "APF": totals.apf,
+            "APF": totals.apf if totals.layer_forwards else None,
             "TPF": totals.tpf,
-            "APT": totals.apt,
+            "APT": totals.apt if totals.layer_forwards else None,
             "expert_files": expert_files,
             "decoded_files": decoded_files,
             "expert_forwards": totals.expert_forwards,
@@ -429,6 +451,19 @@ def main() -> int:
         if metric_files is not None:
             result['metric_files'] = metric_files
             result['metric_records'] = metric_records
+            times = totals.generation_latencies_s
+            if times:
+                result.update(generation_latency_s=sum(times),
+                    mean_generation_latency_s=statistics.mean(times),
+                    median_generation_latency_s=statistics.median(times),
+                    p95_generation_latency_s=statistics.quantiles(times, n=100, method='inclusive')[94]
+                        if len(times) > 1 else times[0],
+                    latency_records=len(times),
+                    accepted_tokens_per_second=totals.timed_accepted_tokens / sum(times))
+                if len(times) != metric_records:
+                    warnings.append('Some records have no latency; timing aggregates use only timed records')
+            else:
+                result['latency_records'] = 0
         else:
             result['accepted_token_mode'] = args.accepted_token_mode
             result['transfer_accepted_tokens'] = totals.transfer_accepted_tokens
@@ -441,9 +476,14 @@ def main() -> int:
     if args.json:
         print(json.dumps(result, indent=2))
     else:
-        print(f"APF: {result['APF']:.4f}")
+        print(f"APF: {result['APF']:.4f}" if result['APF'] is not None else 'APF: unavailable (timing-only run)')
         print(f"TPF: {result['TPF']:.4f}")
-        print(f"APT: {result['APT']:.4f}")
+        print(f"APT: {result['APT']:.4f}" if result['APT'] is not None else 'APT: unavailable (timing-only run)')
+        if result.get('latency_records'):
+            print(f"Generation latency total: {result['generation_latency_s']:.4f} s")
+            print(f"Generation latency mean : {result['mean_generation_latency_s']:.4f} s/sample")
+            print(f"Generation latency p95  : {result['p95_generation_latency_s']:.4f} s/sample")
+            print(f"Accepted tokens/s       : {result['accepted_tokens_per_second']:.4f}")
         print()
         if metric_files is None:
             print(f"Expert JSON files : {expert_files}")

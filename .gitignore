@@ -218,3 +218,6 @@ __marimo__/
 !/evaluation/opencompass/analysis/tools/analyze_dependency_drift.py
 !/evaluation/opencompass/analysis/tools/analyze_dependency_probes.py
 !/evaluation/opencompass/analysis/tools/analyze_frontier_probes.py
+!/evaluation/opencompass/analysis/tools/analyze_decoding_expert_structure.py
+!/evaluation/opencompass/analysis/tools/analyze_frontier_expert_pools.py
+!/evaluation/opencompass/analysis/tools/compare_team_latency.py

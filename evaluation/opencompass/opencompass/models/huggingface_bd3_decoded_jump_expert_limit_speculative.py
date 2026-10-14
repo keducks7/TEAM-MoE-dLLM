@@ -16,6 +16,9 @@ from opencompass.utils.prompt import PromptList
 
 import json
 import os
+import inspect
+import time
+import hashlib
 
 PromptType = Union[PromptList, str]
 
@@ -75,27 +78,118 @@ def _install_team_metric_hooks(model):
     model._sdar_metrics_collector = None
 
 
+def _install_team_native_metrics(model):
+    """Cache MoE references, without registering hooks or replacing forwards."""
+    modules = tuple(m for m in model.modules()
+                    if m.__class__.__name__ == 'SDARMoeSparseMoeBlock')
+    if not modules:
+        raise RuntimeError('No SDAR MoE modules found')
+    model._sdar_team_native_modules = modules
+
+
+def _team_cuda_devices(model):
+    if not torch.cuda.is_available():
+        return []
+    devices = {p.device.index for p in model.parameters() if p.device.type == 'cuda'}
+    for value in getattr(model, 'hf_device_map', {}).values():
+        if isinstance(value, int) or isinstance(value, str) and value.isdigit():
+            devices.add(int(value))
+        elif str(value).startswith('cuda'):
+            devices.add(torch.device(value).index or 0)
+    return sorted(devices)
+
+
+def _synchronize_model_cuda(model):
+    """Include work on EVERY model shard in a wall-clock generation timer."""
+    for device in _team_cuda_devices(model):
+        torch.cuda.synchronize(device)
+
+
+def _run_team_generation(model, generation_args, collect_latency, sample_seed=None):
+    devices = _team_cuda_devices(model) if sample_seed is not None else []
+    with torch.random.fork_rng(devices=devices, enabled=sample_seed is not None):
+        if sample_seed is not None:
+            torch.random.default_generator.manual_seed(sample_seed)
+            for device in devices:
+                with torch.cuda.device(device):
+                    torch.cuda.manual_seed(sample_seed)
+        if collect_latency:
+            _synchronize_model_cuda(model)
+            start = time.perf_counter()
+        outputs = block_diffusion_generate(model=model, **generation_args)
+        if collect_latency:
+            _synchronize_model_cuda(model)
+            elapsed = time.perf_counter() - start
+        else:
+            elapsed = None
+    return outputs, elapsed
+
+
+def _record_team_acceptance(collector, previous_mask, current_tokens, transfer, mask_id):
+    if collector is None:
+        return
+    if not collector.get('collect_experts', True) and collector['accepted_token_mode'] == 'mask_transitions':
+        # Timing-only mode counts generated non-mask output AFTER the timer,
+        # avoiding per-forward reductions/synchronizations for token statistics.
+        return
+    transitions = int((previous_mask & (current_tokens != mask_id)).sum().item())
+    transfer_count = int(transfer.sum().item())
+    collector['transfer_accepted_tokens'] += transfer_count
+    collector['mask_transition_tokens'] += transitions
+    collector['accepted_tokens'] += (transitions if collector['accepted_token_mode'] == 'mask_transitions'
+                                     else transfer_count)
+
+
+def _finalize_team_collector(collector, generated_tokens, mask_id):
+    if (collector is not None and not collector.get('collect_experts', True)
+            and collector['accepted_token_mode'] == 'mask_transitions'):
+        tokens = int((generated_tokens != mask_id).sum().item())
+        collector['accepted_tokens'] = tokens
+        collector['mask_transition_tokens'] = tokens
+        collector['transfer_accepted_tokens'] = None
+
+
 def _team_denoising_forward(model, metrics_collector, **model_inputs):
     """Run one measured TEAM denoising forward and update APF totals."""
     if metrics_collector is None:
         return model(**model_inputs)
 
-    metrics_collector['_active_experts_by_layer'] = {}
-    model._sdar_metrics_collector = metrics_collector
-    try:
+    collect_experts = metrics_collector.get('collect_experts', True)
+    backend = metrics_collector.get('metrics_backend', 'hook')
+    if collect_experts and backend == 'hook':
+        metrics_collector['_active_experts_by_layer'] = {}
+        model._sdar_metrics_collector = metrics_collector
+        try:
+            outputs = model(**model_inputs)
+        finally:
+            model._sdar_metrics_collector = None
+        active_by_layer = metrics_collector.pop('_active_experts_by_layer')
+        expected_layers = model._sdar_team_metric_layer_count
+        if len(active_by_layer) != expected_layers:
+            raise RuntimeError('TEAM metric hook did not capture every MoE layer')
+        active_count = sum(len(experts) for experts in active_by_layer.values())
+    else:
+        if collect_experts:
+            for module in model._sdar_team_native_modules:
+                module._team_last_active_experts = None
+            model_inputs['team_collect_expert_stats'] = True
         outputs = model(**model_inputs)
-    finally:
-        model._sdar_metrics_collector = None
-
-    active_by_layer = metrics_collector.pop('_active_experts_by_layer')
-    expected_layers = model._sdar_team_metric_layer_count
-    if len(active_by_layer) != expected_layers:
-        raise RuntimeError(
-            'TEAM metric hooks captured active experts for '
-            f'{len(active_by_layer)} of {expected_layers} MoE layers.')
-    metrics_collector['activated_experts'] += sum(
-        len(experts) for experts in active_by_layer.values())
-    metrics_collector['layer_forwards'] += expected_layers
+        if collect_experts:
+            counts = [m._team_last_active_experts for m in model._sdar_team_native_modules]
+            if any(c is None for c in counts):
+                raise RuntimeError('Checkpoint lacks native expert counters; update modeling_sdar_moe.py')
+            active_count = sum(counts)
+            expected_layers = len(counts)
+    if collect_experts:
+        metrics_collector['activated_experts'] += active_count
+        metrics_collector['layer_forwards'] += expected_layers
+    for module in getattr(model, '_sdar_team_native_modules', ()):
+        info = getattr(module, '_team_last_pool_info', None)
+        if info is not None:
+            metrics_collector['pool_layer_forwards'] += 1
+            metrics_collector['pool_actual_budget_sum'] += info['actual_budget']
+            metrics_collector['pool_budget_relaxations'] += info['budget_relaxed']
+            metrics_collector['pool_pending_expert_sum'] += info['pending_experts']
     metrics_collector['denoising_forwards'] += 1
     return outputs
 
@@ -243,6 +337,9 @@ def block_diffusion_generate(
     hot_protect_top1=True,
     cold_strategy='none',
     hot_prune_schedule=None,
+    team_pool_strategy='none',
+    team_pool_budget=36,
+    team_pool_coverage_target=.9,
     metrics_collector=None):
     '''
     Args:
@@ -515,6 +612,11 @@ def block_diffusion_generate(
                         hot_prune_count=hot_prune_count, hot_prune_schedule=hot_prune_schedule,
                         hot_protect_top1=hot_protect_top1, choice_id=choice_id,
                         cache_position=spec_cache_position)
+                    if team_pool_strategy != 'none':
+                        forward_kwargs.update(team_pool_strategy=team_pool_strategy,
+                            team_pool_budget=team_pool_budget,
+                            team_pool_coverage_target=team_pool_coverage_target,
+                            team_mask_index=spec_mask_index)
                     active = None
                     if skip_mask is not None:
                         forward_kwargs, active = _pack_team_positions(forward_kwargs, skip_mask)
@@ -633,9 +735,8 @@ def block_diffusion_generate(
                     cur_x = speculative_blocks[:, choice_id * block_length: (choice_id + 1) * block_length]
                     cur_x[transfer_index] = x0[transfer_index]
 
-                if metrics_collector is not None:
-                    metrics_collector['accepted_tokens'] += int(
-                        transfer_index.sum().item())
+                _record_team_acceptance(metrics_collector, mask_index, cur_x,
+                                        transfer_index, mask_id)
         
         x[:, num_block * block_length: (num_block + 1) * block_length] = cur_x
         for stop_idx in stopping_criteria_idx:
@@ -822,6 +923,10 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
                  mode: str = 'none',
                  collect_metrics: bool = False,
                  metrics_output_dir: Optional[str] = None,
+                 collect_latency: bool = False,
+                 metrics_backend: str = 'hook',
+                 accepted_token_mode: str = 'transfer',
+                 sample_seed: Optional[int] = None,
                  **other_kwargs):
 
         self.logger = get_logger()
@@ -836,6 +941,19 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
         self.fastchat_template = fastchat_template
         self.stop_words = list(set(stop_words + self._get_potential_stop_words(path)))
         self.collect_metrics = collect_metrics
+        self.collect_latency = collect_latency
+        self.metrics_backend = metrics_backend
+        self.accepted_token_mode = accepted_token_mode
+        self.sample_seed = sample_seed
+        try:
+            with open(inspect.getfile(type(self.model)), 'rb') as source_file:
+                self._model_source_sha256 = hashlib.sha256(source_file.read()).hexdigest()
+        except (OSError, TypeError, AttributeError):
+            self._model_source_sha256 = None
+        if metrics_backend not in {'hook', 'native'}:
+            raise ValueError('metrics_backend must be hook or native')
+        if accepted_token_mode not in {'transfer', 'mask_transitions'}:
+            raise ValueError('accepted_token_mode must be transfer or mask_transitions')
         self.metrics_output_dir = metrics_output_dir
         self._metrics_sequence = 0
         self._metrics_totals = {
@@ -844,13 +962,24 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
             'layer_forwards': 0,
             'accepted_tokens': 0,
             'denoising_forwards': 0,
+            'generation_latency_s': 0.,
         }
-        if self.collect_metrics:
+        if self.collect_metrics or self.collect_latency:
             if not self.metrics_output_dir:
                 raise ValueError(
-                    'metrics_output_dir is required when collect_metrics=True')
+                    'metrics_output_dir is required for metrics or latency collection')
             os.makedirs(self.metrics_output_dir, exist_ok=True)
+        if self.collect_metrics and self.metrics_backend == 'hook':
             _install_team_metric_hooks(self.model)
+        if (self.metrics_backend == 'native'
+                or self.collect_latency or generation_kwargs.get('team_pool_strategy', 'none') != 'none'):
+            _install_team_native_metrics(self.model)
+        if (self.metrics_backend == 'native'
+                or generation_kwargs.get('team_pool_strategy', 'none') != 'none'):
+            for module in self.model._sdar_team_native_modules:
+                signature = inspect.signature(type(module).forward).parameters
+                if 'team_collect_expert_stats' not in signature or 'team_pool_strategy' not in signature:
+                    raise RuntimeError('Update checkpoint modeling_sdar_moe.py before using native metrics or new pools')
         assert mode in ['none', 'mid']
         self.mode = mode
         self.logger.info(f'using stop words: {self.stop_words}')
@@ -861,7 +990,7 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
 
     def get_metrics_summary(self):
         """Return process-local micro-averaged TEAM metrics."""
-        if not self.collect_metrics:
+        if not (self.collect_metrics or self.collect_latency):
             return None
         totals = self._metrics_totals.copy()
         layer_forwards = totals['layer_forwards']
@@ -875,6 +1004,10 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
             'APF': apf,
             'TPF': tpf,
             'APT': apf / tpf if apf is not None and tpf else None,
+            'metrics_backend': self.metrics_backend if self.collect_metrics else 'none',
+            'accepted_token_mode': self.accepted_token_mode,
+            'accepted_tokens_per_second': totals['accepted_tokens'] / totals['generation_latency_s']
+                if totals['generation_latency_s'] else None,
         })
         return totals
 
@@ -1173,6 +1306,18 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
         hot_protect_top1 = generation_kwargs.get('hot_protect_top1', True)
         cold_strategy = generation_kwargs.get('cold_strategy', 'none')
         hot_prune_schedule = generation_kwargs.get('hot_prune_schedule')
+        team_pool_strategy = generation_kwargs.get('team_pool_strategy', 'none')
+        team_pool_budget = generation_kwargs.get('team_pool_budget', 36)
+        team_pool_coverage_target = generation_kwargs.get('team_pool_coverage_target', .9)
+        if team_pool_strategy not in {'none', 'reference', 'protected'}:
+            raise ValueError('team_pool_strategy must be none, reference or protected')
+        if (type(team_pool_budget) is not int or team_pool_budget < 8
+                or not 0 < team_pool_coverage_target <= 1):
+            raise ValueError('TEAM pool budget must be >=8; coverage target in (0,1]')
+        if team_pool_strategy != 'none' and (
+                cold_expert_budget or cold_reuse_interval or hot_prune_count
+                or hot_prune_schedule is not None or cold_strategy != 'none'):
+            raise ValueError('New pools cannot be mixed with previous cold/hot interventions')
         if cold_strategy not in {'none', 'reuse', 'moe_zero', 'full_skip'}:
             raise ValueError('Unknown cold_strategy')
         if cold_strategy == 'reuse' and cold_reuse_interval < 2:
@@ -1220,18 +1365,30 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
         generation_kwargs['pad_token_id'] = self.tokenizer.pad_token_id
         stopping_criteria_idx = [self.tokenizer.encode(stop, add_special_tokens=False)[0] for stop in stopping_criteria]
         metrics_collector = None
-        if self.collect_metrics:
+        if self.collect_metrics or self.collect_latency:
             metrics_collector = {
                 'activated_experts': 0,
                 'layer_forwards': 0,
                 'accepted_tokens': 0,
                 'denoising_forwards': 0,
+                'transfer_accepted_tokens': 0,
+                'mask_transition_tokens': 0,
+                'collect_experts': self.collect_metrics,
+                'metrics_backend': self.metrics_backend,
+                'accepted_token_mode': self.accepted_token_mode,
+                'pool_layer_forwards': 0,
+                'pool_actual_budget_sum': 0,
+                'pool_budget_relaxations': 0,
+                'pool_pending_expert_sum': 0,
             }
 
-        outputs = block_diffusion_generate(
-            self.model,
-            self.tokenizer,
-            tokens,
+        prompt_sha256 = (hashlib.sha256(tokens['input_ids'].detach().cpu().numpy().tobytes()).hexdigest()
+                         if self.sample_seed is not None or self.collect_metrics or self.collect_latency else None)
+        derived_seed = (int(hashlib.sha256(f'{self.sample_seed}/{prompt_sha256}'.encode()).hexdigest()[:16], 16)
+                        if self.sample_seed is not None else None)
+        generation_args = dict(
+            tokenizer=self.tokenizer,
+            prompt=tokens,
             mask_id=generation_kwargs['mask_id'],
             denoising_steps=generation_kwargs['denoising_steps'],
             gen_length=generation_kwargs['gen_length'],
@@ -1253,10 +1410,17 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
             hot_protect_top1=hot_protect_top1,
             cold_strategy=cold_strategy,
             hot_prune_schedule=hot_prune_schedule,
+            team_pool_strategy=team_pool_strategy,
+            team_pool_budget=team_pool_budget,
+            team_pool_coverage_target=team_pool_coverage_target,
             metrics_collector=metrics_collector,
-            )[:, tokens["input_ids"].shape[1]:]
+            )
+        outputs, generation_latency_s = _run_team_generation(
+            self.model, generation_args, self.collect_latency, derived_seed)
+        outputs = outputs[:, tokens["input_ids"].shape[1]:]
+        _finalize_team_collector(metrics_collector, outputs, generation_kwargs['mask_id'])
 
-        if self.collect_metrics:
+        if self.collect_metrics or self.collect_latency:
             layer_forwards = metrics_collector['layer_forwards']
             denoising_forwards = metrics_collector['denoising_forwards']
             accepted_tokens = metrics_collector['accepted_tokens']
@@ -1267,19 +1431,43 @@ class BD3withChatTemplate_decoded_jump_expert_limit_speculative(BaseModel):
             record = {
                 'schema': 'sdar_metrics_v1',
                 'method': 'team',
+                'prompt_sha256': prompt_sha256,
+                'seed_base': self.sample_seed,
+                'sample_seed': derived_seed,
+                'model_path': self.path,
+                'model_source_sha256': self._model_source_sha256,
+                'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
+                'torch_version': torch.__version__,
+                'generation_settings': {k: generation_kwargs[k] for k in
+                    ('mask_id', 'gen_length', 'block_length', 'denoising_steps',
+                     'temperature', 'top_k', 'top_p', 'remasking', 'threshold')},
+                'metrics_collected': self.collect_metrics,
+                'team_pool_strategy': team_pool_strategy,
+                'team_pool_budget': team_pool_budget,
+                'team_pool_coverage_target': team_pool_coverage_target,
                 'cold_expert_budget': cold_expert_budget,
                 'cold_expert_selection': cold_expert_selection,
                 'sequence': self._metrics_sequence,
                 **metrics_collector,
+                'metrics_backend': self.metrics_backend if self.collect_metrics else 'none',
                 'APF': apf,
                 'TPF': tpf,
                 'APT': apf / tpf if apf is not None and tpf else None,
+                'generation_latency_s': generation_latency_s,
+                'accepted_tokens_per_second': accepted_tokens / generation_latency_s
+                    if generation_latency_s else None,
+                'latency_scope': 'generation_prefill_denoising_cache_commit',
+                'latency_includes_metric_collection': self.collect_metrics,
+                'pool_mean_actual_budget': metrics_collector['pool_actual_budget_sum'] / metrics_collector['pool_layer_forwards']
+                    if metrics_collector['pool_layer_forwards'] else None,
             }
             self._metrics_totals['sequences'] += 1
             for name in (
                     'activated_experts', 'layer_forwards',
                     'accepted_tokens', 'denoising_forwards'):
                 self._metrics_totals[name] += int(metrics_collector[name])
+            if generation_latency_s is not None:
+                self._metrics_totals['generation_latency_s'] += generation_latency_s
             metrics_file = os.path.join(
                 self.metrics_output_dir,
                 f'team_metrics_pid{os.getpid()}.jsonl')
